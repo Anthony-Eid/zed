@@ -6,7 +6,7 @@ Zed includes a vim emulation layer known as "vim mode". This document aims to de
 
 Vim mode in Zed is supposed to primarily "do what you expect": it mostly tries to copy vim exactly, but will use Zed-specific functionality when available to make things smoother.
 
-This means Zed will never be 100% vim compatible, but should be 100% vim familiar! We expect that our vim mode already copes with 90% of your workflow, and we'd like to keep improving it. If you find things that you can’t yet do in vim mode, but which you rely on in your current workflow, please leave feedback in the editor itself (`:feedback`), or [file an issue](https://github.com/zed-industries/zed/issues).
+This means Zed will never be 100% Vim compatible, but should be 100% Vim familiar! We expect that our Vim mode already copes with 90% of your workflow, and we'd like to keep improving it. If you find things that you can’t yet do in Vim mode, but which you rely on in your current workflow, please leave feedback in the editor itself (`:feedback`), or [file an issue](https://github.com/zed-industries/zed/issues).
 
 ## Zed-specific features
 
@@ -137,6 +137,26 @@ Binding `jk` to exit insert mode and go to normal mode:
 }
 ```
 
+### Restoring some sense of normality
+
+If you're using Vim mode on Linux or Windows, you may find that it has overridden keybindings
+that you can't live without. You can restore them to their defaults by copying these into your keymap:
+
+```
+{
+  "context": "Editor && !VimWaiting && !menu",
+  "bindings": {
+    "ctrl-c": "editor::Copy",          // vim default: return to normal mode
+    "ctrl-x": "editor::Cut",           // vim default: increment
+    "ctrl-v": "editor::Paste",         // vim default: visual block mode
+    "ctrl-y": "editor::Undo",          // vim default: line up
+    "ctrl-f": "buffer_search::Deploy", // vim default: page down
+    "ctrl-o": "workspace::Open",       // vim default: go back
+    "ctrl-a": "editor::SelectAll",     // vim default: increment
+  }
+},
+```
+
 ## Command palette
 
 Vim mode allows you to enable Zed’s command palette with `:`. This means that you can use vim's command palette to run any action that Zed supports.
@@ -184,7 +204,7 @@ Currently supported vim-specific commands:
 :%s/foo/bar/
   to replace instances of foo with bar
 :X,Ys/foo/bar/
-    to limit replcaement between line X and Y
+    to limit replacement between line X and Y
     other ranges are not yet implemented
 
 # editing
@@ -199,13 +219,13 @@ Currently supported vim-specific commands:
 As any Zed command is available, you may find that it's helpful to remember mnemonics that run the correct command. For example:
 
 ```
-:diff    Toggle Hunk [Diff]
-:diffs    Toggle all Hunk [Diffs]
-:revert  Revert Selected Hunks
-:cpp  [C]o[p]y [P]ath to file
-:crp  [C]opy [r]elative [P]ath
+:diff   Toggle Hunk [Diff]
+:diffs  Toggle all Hunk [Diffs]
+:revert Revert Selected Hunks
+:cpp    [C]o[p]y [P]ath to file
+:crp    [C]opy [r]elative [P]ath
 :reveal [Reveal] in finder
-:zlog Open [Z]ed Log
+:zlog   Open [Z]ed Log
 ```
 
 ## Settings
@@ -215,9 +235,9 @@ Some vim settings are available to modify the default vim behavior:
 ```json
 {
   "vim": {
-    // "always": use system clipboard
-    // "never": don't use system clipboard
-    // "on_yank": use system clipboard for yank operations
+    // "always": use system clipboard when no register is specified
+    // "never": don't use system clipboard unless "+ or "* is specified
+    // "on_yank": use system clipboard for yank operations when no register is specified
     "use_system_clipboard": "always",
     // Lets `f` and `t` motions extend across multiple lines
     "use_multiline_find": true
@@ -271,6 +291,22 @@ Subword motion is not enabled by default. To enable it, add these bindings to yo
       "g e": "vim::PreviousSubwordEnd"
     }
   },
+```
+
+Surrounding the selection in visual mode is also not enabled by default (`shift-s` normally behaves like `c`). To enable it, add the following to your keymap.
+
+```json
+  {
+    "context": "Editor && vim_mode == visual && !VimWaiting && !VimObject",
+    "bindings": {
+      "shift-s": [
+        "vim::PushOperator",
+        {
+          "AddSurrounds": {}
+        }
+      ]
+    }
+  }
 ```
 
 ## Supported plugins
