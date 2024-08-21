@@ -6,12 +6,11 @@ use dap::{
 };
 use editor::Editor;
 use gpui::{
-    actions, impl_actions, list, AnyElement, AppContext, AsyncWindowContext, EventEmitter,
-    FocusHandle, FocusableView, ListState, Subscription, View, WeakView,
+    impl_actions, list, AnyElement, AppContext, AsyncWindowContext, EventEmitter, FocusHandle,
+    FocusableView, ListState, Subscription, View, WeakView,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::default;
 use std::sync::Arc;
 use ui::{prelude::*, Tooltip};
 use ui::{ListItem, WindowContext};
@@ -50,19 +49,19 @@ pub struct DebugPanelItem {
     _subscriptions: Vec<Subscription>,
 }
 
-actions!(
-    debug_panel_item,
-    [Continue, StepOver, StepIn, StepOut, Restart, Pause, Stop, Disconnect]
-);
-
 impl_actions!(debug_panel_item, [DebugItemAction]);
 
+/// This struct is for actions that should be triggered even when
+/// the debug pane is not in focus. This is done by setting workspace
+/// as the action listener then having workspace call `handle_workspace_action`
 #[derive(Clone, Deserialize, PartialEq, Default)]
 pub struct DebugItemAction {
     kind: DebugPanelItemActionKind,
 }
 
-#[derive(Deserialize, PartialEq, Default, Clone)]
+/// Actions that can be sent to workspace
+/// currently all of these are button toggles
+#[derive(Deserialize, PartialEq, Default, Clone, Debug)]
 enum DebugPanelItemActionKind {
     #[default]
     Continue,
@@ -625,44 +624,46 @@ impl DebugPanelItem {
         })
     }
 
+    /// Actions that should be handled even when Debug Panel is not in focus
     pub fn workspace_action_handler(
         workspace: &mut Workspace,
         action: &DebugItemAction,
         cx: &mut ViewContext<Workspace>,
     ) {
-        let Some(debug_panel) = workspace.panel::<DebugPanel>(cx) else {
-            return;
-        };
-
-        let Some(pane) = debug_panel.read(cx).pane() else {
+        let Some(pane) = workspace
+            .panel::<DebugPanel>(cx)
+            .and_then(|panel| panel.read(cx).pane())
+        else {
+            log::error!(
+                "Can't get Debug panel to handle Debug action: {:?}
+                This shouldn't happen because there has to be an Debug panel to click a button and trigger this action",
+                action.kind
+            );
             return;
         };
 
         pane.update(cx, |this, cx| {
-            let Some(active_item) = this.active_item() else {
-                return;
-            };
-
-            let Some(active_item) = active_item.downcast::<DebugPanelItem>() else {
+            let Some(active_item) = this
+                .active_item()
+                .and_then(|item| item.downcast::<DebugPanelItem>())
+            else {
                 return;
             };
 
             active_item.update(cx, |item, cx| match action.kind {
-                DebugPanelItemActionKind::Stop => item.handle_stop_action(&Stop, cx),
-                DebugPanelItemActionKind::Continue => item.handle_continue_action(&Continue, cx),
-                DebugPanelItemActionKind::StepIn => item.handle_step_in_action(&StepIn, cx),
-                DebugPanelItemActionKind::StepOut => item.handle_step_out_action(&StepOut, cx),
-                DebugPanelItemActionKind::StepOver => item.handle_step_over_action(&StepOver, cx),
-                DebugPanelItemActionKind::Pause => item.handle_pause_action(&Pause, cx),
-                DebugPanelItemActionKind::Disconnect => {
-                    item.handle_disconnect_action(&Disconnect, cx)
-                }
-                DebugPanelItemActionKind::Restart => item.handle_restart_action(&Restart, cx),
+                DebugPanelItemActionKind::Stop => item.handle_stop_action(cx),
+                DebugPanelItemActionKind::Continue => item.handle_continue_action(cx),
+                DebugPanelItemActionKind::StepIn => item.handle_step_in_action(cx),
+                DebugPanelItemActionKind::StepOut => item.handle_step_out_action(cx),
+                DebugPanelItemActionKind::StepOver => item.handle_step_over_action(cx),
+                DebugPanelItemActionKind::Pause => item.handle_pause_action(cx),
+                DebugPanelItemActionKind::Disconnect => item.handle_disconnect_action(cx),
+                DebugPanelItemActionKind::Restart => item.handle_restart_action(cx),
             });
         });
     }
 
-    fn handle_continue_action(&mut self, _: &Continue, cx: &mut ViewContext<Self>) {
+    fn handle_continue_action(&mut self, cx: &mut ViewContext<Self>) {
         let client = self.client.clone();
         let thread_id = self.thread_id;
         let previous_status = self.current_thread_state().status;
@@ -675,7 +676,7 @@ impl DebugPanelItem {
         .detach_and_log_err(cx);
     }
 
-    fn handle_step_over_action(&mut self, _: &StepOver, cx: &mut ViewContext<Self>) {
+    fn handle_step_over_action(&mut self, cx: &mut ViewContext<Self>) {
         let client = self.client.clone();
         let thread_id = self.thread_id;
         let previous_status = self.current_thread_state().status;
@@ -688,7 +689,7 @@ impl DebugPanelItem {
         .detach_and_log_err(cx);
     }
 
-    fn handle_step_in_action(&mut self, _: &StepIn, cx: &mut ViewContext<Self>) {
+    fn handle_step_in_action(&mut self, cx: &mut ViewContext<Self>) {
         let client = self.client.clone();
         let thread_id = self.thread_id;
         let previous_status = self.current_thread_state().status;
@@ -701,7 +702,7 @@ impl DebugPanelItem {
         .detach_and_log_err(cx);
     }
 
-    fn handle_step_out_action(&mut self, _: &StepOut, cx: &mut ViewContext<Self>) {
+    fn handle_step_out_action(&mut self, cx: &mut ViewContext<Self>) {
         let client = self.client.clone();
         let thread_id = self.thread_id;
         let previous_status = self.current_thread_state().status;
@@ -714,7 +715,7 @@ impl DebugPanelItem {
         .detach_and_log_err(cx);
     }
 
-    fn handle_restart_action(&mut self, _: &Restart, cx: &mut ViewContext<Self>) {
+    fn handle_restart_action(&mut self, cx: &mut ViewContext<Self>) {
         let client = self.client.clone();
 
         cx.background_executor()
@@ -722,7 +723,7 @@ impl DebugPanelItem {
             .detach_and_log_err(cx);
     }
 
-    fn handle_pause_action(&mut self, _: &Pause, cx: &mut ViewContext<Self>) {
+    fn handle_pause_action(&mut self, cx: &mut ViewContext<Self>) {
         let client = self.client.clone();
         let thread_id = self.thread_id;
         cx.background_executor()
@@ -730,7 +731,7 @@ impl DebugPanelItem {
             .detach_and_log_err(cx);
     }
 
-    fn handle_stop_action(&mut self, _: &Stop, cx: &mut ViewContext<Self>) {
+    fn handle_stop_action(&mut self, cx: &mut ViewContext<Self>) {
         let client = self.client.clone();
         let thread_ids = vec![self.thread_id; 1];
 
@@ -739,7 +740,7 @@ impl DebugPanelItem {
             .detach_and_log_err(cx);
     }
 
-    fn handle_disconnect_action(&mut self, _: &Disconnect, cx: &mut ViewContext<Self>) {
+    fn handle_disconnect_action(&mut self, cx: &mut ViewContext<Self>) {
         let client = self.client.clone();
         cx.background_executor()
             .spawn(async move { client.disconnect(None, Some(true), None).await })
