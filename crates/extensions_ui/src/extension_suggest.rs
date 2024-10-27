@@ -169,10 +169,13 @@ pub(crate) fn suggest(buffer: Model<Buffer>, cx: &mut ViewContext<Workspace>) {
 
         workspace.show_notification(notification_id, cx, |cx| {
             cx.new_view(move |_cx| {
-                simple_message_notification::MessageNotification::new(format!(
-                    "Do you want to install the recommended '{}' extension for '{}' files?",
-                    extension_id, file_name_or_extension
-                ))
+                simple_message_notification::MessageNotification::new(
+                    format!(
+                        "Do you want to install the recommended '{}' extension for '{}' files?",
+                        extension_id, file_name_or_extension
+                    ),
+                    None,
+                )
                 .with_click_message("Yes")
                 .on_click({
                     let extension_id = extension_id.clone();

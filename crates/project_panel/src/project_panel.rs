@@ -915,7 +915,8 @@ impl ProjectPanel {
                                 project_panel.project.update(cx, |_, cx| {
                                     cx.emit(project::Event::Toast {
                                         notification_id: "excluded-directory".into(),
-                                        message: format!("Created an excluded directory at {abs_path:?}.\nAlter `file_scan_exclusions` in the settings to show it in the panel")
+                                        title: format!("Created an excluded directory at {abs_path:?}."),
+                                        message: Some("Alter `file_scan_exclusions` in the settings to show it in the panel".into())
                                     })
                                 });
                                 None

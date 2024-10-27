@@ -184,11 +184,13 @@ impl Workspace {
             cx.new_view(|_cx| match toast.on_click.as_ref() {
                 Some((click_msg, on_click)) => {
                     let on_click = on_click.clone();
-                    simple_message_notification::MessageNotification::new(toast.msg.clone())
+                    simple_message_notification::MessageNotification::new(toast.msg.clone(), None)
                         .with_click_message(click_msg.clone())
                         .on_click(move |cx| on_click(cx))
                 }
-                None => simple_message_notification::MessageNotification::new(toast.msg.clone()),
+                None => {
+                    simple_message_notification::MessageNotification::new(toast.msg.clone(), None)
+                }
             })
         });
         if toast.autohide {
@@ -444,15 +446,16 @@ impl EventEmitter<DismissEvent> for ErrorMessagePrompt {}
 
 pub mod simple_message_notification {
     use gpui::{
-        div, DismissEvent, EventEmitter, InteractiveElement, ParentElement, Render, SharedString,
-        StatefulInteractiveElement, Styled, ViewContext,
+        div, DismissEvent, EventEmitter, FontWeight, InteractiveElement, ParentElement, Render,
+        SharedString, StatefulInteractiveElement, Styled, ViewContext,
     };
     use std::sync::Arc;
     use ui::prelude::*;
     use ui::{h_flex, v_flex, Button, Icon, IconName, Label, StyledExt};
 
     pub struct MessageNotification {
-        message: SharedString,
+        title: SharedString,
+        message: Option<SharedString>,
         on_click: Option<Arc<dyn Fn(&mut ViewContext<Self>)>>,
         click_message: Option<SharedString>,
         secondary_click_message: Option<SharedString>,
@@ -462,12 +465,13 @@ pub mod simple_message_notification {
     impl EventEmitter<DismissEvent> for MessageNotification {}
 
     impl MessageNotification {
-        pub fn new<S>(message: S) -> MessageNotification
+        pub fn new<S>(title: S, message: Option<S>) -> MessageNotification
         where
             S: Into<SharedString>,
         {
             Self {
-                message: message.into(),
+                title: title.into(),
+                message: message.map(|message| message.into()),
                 on_click: None,
                 click_message: None,
                 secondary_on_click: None,
@@ -520,7 +524,11 @@ pub mod simple_message_notification {
                 .child(
                     h_flex()
                         .justify_between()
-                        .child(div().max_w_80().child(Label::new(self.message.clone())))
+                        .child(
+                            div()
+                                .max_w_80()
+                                .child(Label::new(self.title.clone()).weight(FontWeight::BOLD)),
+                        )
                         .child(
                             div()
                                 .id("cancel")
@@ -529,6 +537,9 @@ pub mod simple_message_notification {
                                 .on_click(cx.listener(|this, _, cx| this.dismiss(cx))),
                         ),
                 )
+                .when_some(self.message.clone(), |this, message| {
+                    this.child(div().py_1p5().text_xs().child(message))
+                })
                 .child(
                     h_flex()
                         .gap_3()

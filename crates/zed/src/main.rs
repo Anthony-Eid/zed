@@ -557,12 +557,15 @@ fn handle_keymap_changed(error: Option<anyhow::Error>, cx: &mut AppContext) {
                 Some(error) => {
                     workspace.show_notification(id.clone(), cx, |cx| {
                         cx.new_view(|_| {
-                            MessageNotification::new(format!("Invalid keymap file\n{error}"))
-                                .with_click_message("Open keymap file")
-                                .on_click(|cx| {
-                                    cx.dispatch_action(zed_actions::OpenKeymap.boxed_clone());
-                                    cx.emit(DismissEvent);
-                                })
+                            MessageNotification::new(
+                                "Invalid keymap file".into(),
+                                Some(format!("{error}")),
+                            )
+                            .with_click_message("Open keymap file")
+                            .on_click(|cx| {
+                                cx.dispatch_action(zed_actions::OpenKeymap.boxed_clone());
+                                cx.emit(DismissEvent);
+                            })
                         })
                     });
                 }
@@ -588,9 +591,10 @@ fn handle_settings_changed(error: Option<anyhow::Error>, cx: &mut AppContext) {
                         } else {
                             workspace.show_notification(id.clone(), cx, |cx| {
                                 cx.new_view(|_| {
-                                    MessageNotification::new(format!(
-                                        "Invalid user settings file\n{error}"
-                                    ))
+                                    MessageNotification::new(
+                                        format!("Invalid user settings file"),
+                                        Some(format!("{error}")),
+                                    )
                                     .with_click_message("Open settings file")
                                     .on_click(|cx| {
                                         cx.dispatch_action(zed_actions::OpenSettings.boxed_clone());

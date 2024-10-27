@@ -225,7 +225,8 @@ pub enum Event {
     LanguageServerLog(LanguageServerId, LanguageServerLogType, String),
     Toast {
         notification_id: SharedString,
-        message: String,
+        title: String,
+        message: Option<String>,
     },
     HideToast {
         notification_id: SharedString,
@@ -2097,7 +2098,8 @@ impl Project {
             }
             LspStoreEvent::Notification(message) => cx.emit(Event::Toast {
                 notification_id: "lsp".into(),
-                message: message.clone(),
+                message: None,
+                title: message.clone(),
             }),
             LspStoreEvent::SnippetEdit {
                 buffer_id,
@@ -2144,11 +2146,11 @@ impl Project {
         match event {
             SettingsObserverEvent::LocalSettingsUpdated(result) => match result {
                 Err(InvalidSettingsError::LocalSettings { message, path }) => {
-                    let message =
-                        format!("Failed to set local settings in {:?}:\n{}", path, message);
+                    let message = format!("In {:?}:\n{}", path, message);
                     cx.emit(Event::Toast {
                         notification_id: "local-settings".into(),
-                        message,
+                        title: "Failed to set local settings".into(),
+                        message: Some(message),
                     });
                 }
                 Ok(_) => cx.emit(Event::HideToast {
@@ -3525,7 +3527,8 @@ impl Project {
         this.update(&mut cx, |_, cx| {
             cx.emit(Event::Toast {
                 notification_id: envelope.payload.notification_id.into(),
-                message: envelope.payload.message,
+                title: envelope.payload.message,
+                message: None, // TODO: fall back so we support older zed versions
             });
             Ok(())
         })?

@@ -300,7 +300,8 @@ impl TaskStore {
                         log::error!("Failed to load user tasks: {err}");
                         cx.emit(crate::Event::Toast {
                             notification_id: "load-user-tasks".into(),
-                            message: format!("Invalid global tasks file\n{err}"),
+                            title: "Invalid global tasks file".into(),
+                            message: Some(format!("{err}")),
                         });
                     }
                     cx.refresh();

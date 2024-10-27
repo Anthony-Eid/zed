@@ -841,11 +841,12 @@ impl Workspace {
 
                 project::Event::Toast {
                     notification_id,
+                    title,
                     message,
                 } => this.show_notification(
                     NotificationId::named(notification_id.clone()),
                     cx,
-                    |cx| cx.new_view(|_| MessageNotification::new(message.clone())),
+                    |cx| cx.new_view(|_| MessageNotification::new(title.clone(), message.clone())),
                 ),
 
                 project::Event::HideToast { notification_id } => {
@@ -4661,7 +4662,7 @@ fn notify_if_database_failed(workspace: WindowHandle<Workspace>, cx: &mut AsyncA
                     cx,
                     |cx| {
                         cx.new_view(|_| {
-                            MessageNotification::new("Failed to load the database file.")
+                            MessageNotification::new("Failed to load the database file.", None)
                                 .with_click_message("File an issue")
                                 .on_click(|cx| cx.open_url(REPORT_ISSUE_URL))
                         })

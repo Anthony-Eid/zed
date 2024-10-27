@@ -751,10 +751,13 @@ fn open_log_file(workspace: &mut Workspace, cx: &mut ViewContext<Workspace>) {
                                 cx,
                                 |cx| {
                                     cx.new_view(|_| {
-                                        MessageNotification::new(format!(
-                                            "Unable to access/open log file at path {:?}",
-                                            paths::log_file().as_path()
-                                        ))
+                                        MessageNotification::new(
+                                            format!(
+                                                "Unable to access/open log file at path {:?}",
+                                                paths::log_file().as_path()
+                                            ),
+                                            None,
+                                        )
                                     })
                                 },
                             );
@@ -987,7 +990,7 @@ fn open_local_file(
         struct NoOpenFolders;
 
         workspace.show_notification(NotificationId::unique::<NoOpenFolders>(), cx, |cx| {
-            cx.new_view(|_| MessageNotification::new("This project has no folders open."))
+            cx.new_view(|_| MessageNotification::new("This project has no folders open.", None))
         })
     }
 }
