@@ -1,6 +1,8 @@
 mod derive_path_str;
 
 use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, DeriveInput};
 
 /// Derives the `path` method for an enum.
 ///
@@ -50,4 +52,41 @@ pub fn derive_path_str(input: TokenStream) -> TokenStream {
 pub fn path_str(_args: TokenStream, input: TokenStream) -> TokenStream {
     // This attribute doesn't modify the input, it's just a marker
     input
+}
+
+#[proc_macro_derive(SettingsToggleRender)]
+pub fn settings_toggle_render_derive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let check_box = format!("{}", stringify!(#name).to_lowercase());
+
+    let expanded = quote! {
+        impl RenderOnce for #name {
+            fn render(self, cx: &mut WindowContext) -> impl IntoElement {
+                const _: fn() = || {
+                    fn assert_impl<T: EditableSettingControl<Value = bool>>() {}
+                    assert_impl::<#name>();
+                };
+
+                let value = Self::read(cx);
+
+                CheckboxWithLabel::new(
+                    #check_box,
+                    Label::new(self.name()),
+                    value.into(),
+                    |selection, cx| {
+                        Self::write(
+                            match selection {
+                                Selection::Selected => true,
+                                Selection::Unselected | Selection::Indeterminate => false,
+                            },
+                            cx
+                        );
+                    },
+                )
+            }
+        }
+    };
+
+    TokenStream::from(expanded)
 }

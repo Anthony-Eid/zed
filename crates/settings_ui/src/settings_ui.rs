@@ -39,12 +39,12 @@ pub fn init(cx: &mut AppContext) {
 
         let settings_ui_actions = [TypeId::of::<OpenSettingsEditor>()];
 
-        CommandPaletteFilter::update_global(cx, |filter, _cx| {
-            filter.hide_action_types(&settings_ui_actions);
-        });
+        // CommandPaletteFilter::update_global(cx, |filter, _cx| {
+        //     filter.hide_action_types(&settings_ui_actions);
+        // });
 
-        cx.observe_flag::<SettingsUiFeatureFlag, _>(move |is_enabled, _view, cx| {
-            if is_enabled {
+        cx.observe_flag::<SettingsUiFeatureFlag, _>(move |_is_enabled, _view, cx| {
+            if true {
                 CommandPaletteFilter::update_global(cx, |filter, _cx| {
                     filter.show_action_types(settings_ui_actions.iter());
                 });

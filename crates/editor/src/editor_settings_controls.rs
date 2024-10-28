@@ -8,6 +8,7 @@ use ui::{
     prelude::*, CheckboxWithLabel, ContextMenu, DropdownMenu, NumericStepper, SettingsContainer,
     SettingsGroup,
 };
+use ui_macros::SettingsToggleRender;
 
 use crate::EditorSettings;
 
@@ -51,6 +52,7 @@ impl RenderOnce for EditorSettingsControls {
                         .child(RelativeLineNumbersControl),
                 ),
             )
+            .child(SettingsGroup::new("Cursor").child(CursorBlink))
     }
 }
 
@@ -424,5 +426,34 @@ impl RenderOnce for RelativeLineNumbersControl {
                 )
             }),
         )
+    }
+}
+
+#[derive(IntoElement, SettingsToggleRender)]
+struct CursorBlink;
+
+impl EditableSettingControl for CursorBlink {
+    type Value = bool;
+    type Settings = EditorSettings;
+
+    fn name(&self) -> SharedString {
+        "Cursor Blink".into()
+    }
+
+    fn read(cx: &AppContext) -> Self::Value {
+        let settings = EditorSettings::get_global(cx);
+        settings.cursor_blink
+    }
+
+    fn apply(
+        settings: &mut <Self::Settings as Settings>::FileContent,
+        value: Self::Value,
+        _cx: &AppContext,
+    ) {
+        if let Some(cursor_blink) = settings.cursor_blink.as_mut() {
+            *cursor_blink = value;
+        } else {
+            settings.cursor_blink = Some(value);
+        }
     }
 }

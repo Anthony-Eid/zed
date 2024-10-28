@@ -3711,6 +3711,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "ui",
+ "ui_macros",
  "unindent",
  "url",
  "util",
