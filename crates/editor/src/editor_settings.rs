@@ -305,7 +305,7 @@ pub struct ToolbarContent {
 }
 
 /// Scrollbar related settings
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Default, Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct ScrollbarContent {
     /// When to show the scrollbar in the editor.
     ///

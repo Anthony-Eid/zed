@@ -10,7 +10,7 @@ use ui::{
 };
 use ui_macros::SettingsToggleRender;
 
-use crate::EditorSettings;
+use crate::{EditorSettings, ShowScrollbar};
 
 #[derive(IntoElement)]
 pub struct EditorSettingsControls {}
@@ -57,6 +57,7 @@ impl RenderOnce for EditorSettingsControls {
                     .child(CursorBlink)
                     .child(CursorShape),
             )
+            .child(SettingsGroup::new("Scrollbar").child(ScrollbarShow))
     }
 }
 
@@ -524,6 +525,78 @@ impl RenderOnce for CursorShape {
                     .custom_entry(
                         |_cx| Label::new("Underline").into_any_element(),
                         move |cx| Self::write(language::CursorShape::Underline, cx),
+                    )
+                }),
+            ))
+    }
+}
+
+#[derive(IntoElement)]
+struct ScrollbarShow;
+
+impl EditableSettingControl for ScrollbarShow {
+    type Value = ShowScrollbar;
+    type Settings = EditorSettings;
+
+    fn name(&self) -> SharedString {
+        "Show Scollbar".into()
+    }
+
+    fn read(cx: &AppContext) -> Self::Value {
+        let settings = EditorSettings::get_global(cx);
+        settings.scrollbar.show
+    }
+
+    fn apply(
+        settings: &mut <Self::Settings as Settings>::FileContent,
+        value: Self::Value,
+        _cx: &AppContext,
+    ) {
+        if let Some(bar) = settings.scrollbar.as_mut() {
+            bar.show = Some(value)
+        } else {
+            settings.scrollbar = Some(crate::editor_settings::ScrollbarContent {
+                show: Some(value),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+impl RenderOnce for ScrollbarShow {
+    fn render(self, cx: &mut WindowContext) -> impl IntoElement {
+        let value = Self::read(cx);
+
+        let label = match value {
+            ShowScrollbar::Auto => "Auto",
+            ShowScrollbar::Always => "Always",
+            ShowScrollbar::System => "System",
+            ShowScrollbar::Never => "Never",
+        };
+
+        h_flex()
+            .gap_2()
+            .justify_between()
+            .child(Label::new("Show Scrollbar"))
+            .child(DropdownMenu::new(
+                "show-scrollbar",
+                label,
+                ContextMenu::build(cx, |menu, _cx| {
+                    menu.custom_entry(
+                        |_cx| Label::new("Auto").into_any_element(),
+                        move |cx| Self::write(ShowScrollbar::Auto, cx),
+                    )
+                    .custom_entry(
+                        |_cx| Label::new("Always").into_any_element(),
+                        move |cx| Self::write(ShowScrollbar::Always, cx),
+                    )
+                    .custom_entry(
+                        |_cx| Label::new("System").into_any_element(),
+                        move |cx| Self::write(ShowScrollbar::System, cx),
+                    )
+                    .custom_entry(
+                        |_cx| Label::new("Never").into_any_element(),
+                        move |cx| Self::write(ShowScrollbar::Never, cx),
                     )
                 }),
             ))
