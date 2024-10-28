@@ -52,7 +52,11 @@ impl RenderOnce for EditorSettingsControls {
                         .child(RelativeLineNumbersControl),
                 ),
             )
-            .child(SettingsGroup::new("Cursor").child(CursorBlink))
+            .child(
+                SettingsGroup::new("Cursor")
+                    .child(CursorBlink)
+                    .child(CursorShape),
+            )
     }
 }
 
@@ -455,5 +459,73 @@ impl EditableSettingControl for CursorBlink {
         } else {
             settings.cursor_blink = Some(value);
         }
+    }
+}
+
+#[derive(IntoElement)]
+struct CursorShape;
+
+impl EditableSettingControl for CursorShape {
+    type Value = language::CursorShape;
+    type Settings = EditorSettings;
+
+    fn name(&self) -> SharedString {
+        "Cursor Shape".into()
+    }
+
+    fn read(cx: &AppContext) -> Self::Value {
+        let settings = EditorSettings::get_global(cx);
+        settings
+            .cursor_shape
+            .clone()
+            .unwrap_or(language::CursorShape::Bar)
+    }
+
+    fn apply(
+        settings: &mut <Self::Settings as Settings>::FileContent,
+        value: Self::Value,
+        _cx: &AppContext,
+    ) {
+        settings.cursor_shape = Some(value);
+    }
+}
+
+impl RenderOnce for CursorShape {
+    fn render(self, cx: &mut WindowContext) -> impl IntoElement {
+        let value = Self::read(cx);
+
+        let label = match value {
+            language::CursorShape::Bar => "Bar",
+            language::CursorShape::Hollow => "Hollow",
+            language::CursorShape::Block => "Block",
+            language::CursorShape::Underline => "Underline",
+        };
+
+        h_flex()
+            .gap_2()
+            .justify_between()
+            .child(Label::new("Cursor Shape"))
+            .child(DropdownMenu::new(
+                "cursor-shape",
+                label,
+                ContextMenu::build(cx, |menu, _cx| {
+                    menu.custom_entry(
+                        |_cx| Label::new("Bar").into_any_element(),
+                        move |cx| Self::write(language::CursorShape::Bar, cx),
+                    )
+                    .custom_entry(
+                        |_cx| Label::new("Hollow").into_any_element(),
+                        move |cx| Self::write(language::CursorShape::Hollow, cx),
+                    )
+                    .custom_entry(
+                        |_cx| Label::new("Block").into_any_element(),
+                        move |cx| Self::write(language::CursorShape::Block, cx),
+                    )
+                    .custom_entry(
+                        |_cx| Label::new("Underline").into_any_element(),
+                        move |cx| Self::write(language::CursorShape::Underline, cx),
+                    )
+                }),
+            ))
     }
 }
