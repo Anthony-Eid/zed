@@ -5,7 +5,7 @@ use std::any::TypeId;
 use command_palette_hooks::CommandPaletteFilter;
 use editor::EditorSettingsControls;
 use feature_flags::{FeatureFlag, FeatureFlagViewExt};
-use gpui::{actions, AppContext, EventEmitter, FocusHandle, FocusableView, View};
+use gpui::{actions, AppContext, EventEmitter, FocusHandle, FocusableView, ScrollHandle, View};
 use ui::prelude::*;
 use workspace::item::{Item, ItemEvent};
 use workspace::Workspace;
@@ -61,12 +61,14 @@ pub fn init(cx: &mut AppContext) {
 
 pub struct SettingsPage {
     focus_handle: FocusHandle,
+    scroll_handle: ScrollHandle,
 }
 
 impl SettingsPage {
     pub fn new(_workspace: &Workspace, cx: &mut ViewContext<Workspace>) -> View<Self> {
         cx.new_view(|cx| Self {
             focus_handle: cx.focus_handle(),
+            scroll_handle: Default::default(),
         })
     }
 }
@@ -101,24 +103,33 @@ impl Item for SettingsPage {
 
 impl Render for SettingsPage {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        let height = cx.viewport_size().height - Pixels(100f32);
+
         v_flex()
+            .id("settings-editor")
+            .h(height)
             .p_4()
-            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
             .gap_4()
             .child(Label::new("Settings").size(LabelSize::Large))
             .child(
-                v_flex().gap_1().child(Label::new("Appearance")).child(
-                    v_flex()
-                        .elevation_2(cx)
-                        .child(AppearanceSettingsControls::new()),
-                ),
-            )
-            .child(
-                v_flex().gap_1().child(Label::new("Editor")).child(
-                    v_flex()
-                        .elevation_2(cx)
-                        .child(EditorSettingsControls::new()),
-                ),
+                v_flex()
+                    .child(Label::new("Settings").size(LabelSize::Large))
+                    .child(
+                        v_flex().gap_1().child(Label::new("Appearance")).child(
+                            v_flex()
+                                .elevation_2(cx)
+                                .child(AppearanceSettingsControls::new()),
+                        ),
+                    )
+                    .child(
+                        v_flex().gap_1().child(Label::new("Editor")).child(
+                            v_flex()
+                                .elevation_2(cx)
+                                .child(EditorSettingsControls::new()),
+                        ),
+                    ),
             )
     }
 }
