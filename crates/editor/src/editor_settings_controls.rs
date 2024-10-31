@@ -463,6 +463,34 @@ impl EditableSettingControl for CursorBlink {
     }
 }
 
+#[macro_export]
+macro_rules! enum_dropdown_menu {
+    ($enum_type:ty, $control_name:expr, $id:expr, $cx:expr, $($variant:ident),* $(,)?) => {{
+        let value = Self::read($cx);
+
+        let label = match value {
+            $(<$enum_type>::$variant => stringify!($variant),)*
+        };
+
+        h_flex()
+            .gap_2()
+            .justify_between()
+            .child(Label::new($control_name))
+            .child(DropdownMenu::new(
+                $id,
+                label,
+                ContextMenu::build($cx, |menu, _cx| {
+                    menu$(
+                        .custom_entry(
+                            |_cx| Label::new(stringify!($variant)).into_any_element(),
+                            move |cx| Self::write(<$enum_type>::$variant, cx),
+                        )
+                    )*
+                }),
+            ))
+    }};
+}
+
 #[derive(IntoElement)]
 struct CursorShape;
 
@@ -565,40 +593,15 @@ impl EditableSettingControl for ScrollbarShow {
 
 impl RenderOnce for ScrollbarShow {
     fn render(self, cx: &mut WindowContext) -> impl IntoElement {
-        let value = Self::read(cx);
-
-        let label = match value {
-            ShowScrollbar::Auto => "Auto",
-            ShowScrollbar::Always => "Always",
-            ShowScrollbar::System => "System",
-            ShowScrollbar::Never => "Never",
-        };
-
-        h_flex()
-            .gap_2()
-            .justify_between()
-            .child(Label::new("Show Scrollbar"))
-            .child(DropdownMenu::new(
-                "show-scrollbar",
-                label,
-                ContextMenu::build(cx, |menu, _cx| {
-                    menu.custom_entry(
-                        |_cx| Label::new("Auto").into_any_element(),
-                        move |cx| Self::write(ShowScrollbar::Auto, cx),
-                    )
-                    .custom_entry(
-                        |_cx| Label::new("Always").into_any_element(),
-                        move |cx| Self::write(ShowScrollbar::Always, cx),
-                    )
-                    .custom_entry(
-                        |_cx| Label::new("System").into_any_element(),
-                        move |cx| Self::write(ShowScrollbar::System, cx),
-                    )
-                    .custom_entry(
-                        |_cx| Label::new("Never").into_any_element(),
-                        move |cx| Self::write(ShowScrollbar::Never, cx),
-                    )
-                }),
-            ))
+        enum_dropdown_menu!(
+            ShowScrollbar,
+            "Show Mode",
+            "show-scrollbar", // static string for id
+            cx,
+            Auto,
+            Always,
+            System,
+            Never
+        )
     }
 }
