@@ -304,6 +304,7 @@ pub enum Event {
     RefreshInlayHints,
     RevealInProjectPanel(ProjectEntryId),
     SnippetEdit(BufferId, Vec<(lsp::Range, Snippet)>),
+    ExpandedAllForEntry(WorktreeId, ProjectEntryId),
 }
 
 pub enum DebugAdapterClientState {
@@ -863,6 +864,9 @@ impl Project {
             let dap_store =
                 cx.new(|cx| DapStore::new_remote(SSH_PROJECT_ID, client.clone().into(), cx));
 
+            let git_state =
+                Some(cx.new(|cx| GitState::new(&worktree_store, languages.clone(), cx)));
+
             cx.subscribe(&ssh, Self::on_ssh_event).detach();
             cx.observe(&ssh, |_, _, cx| cx.notify()).detach();
 
@@ -876,7 +880,7 @@ impl Project {
                 dap_store,
                 join_project_response_message_id: 0,
                 client_state: ProjectClientState::Local,
-                git_state: None,
+                git_state,
                 client_subscriptions: Vec::new(),
                 _subscriptions: vec![
                     cx.on_release(Self::release),
@@ -1071,6 +1075,9 @@ impl Project {
             SettingsObserver::new_remote(worktree_store.clone(), task_store.clone(), cx)
         })?;
 
+        let git_state =
+            Some(cx.new(|cx| GitState::new(&worktree_store, languages.clone(), cx))).transpose()?;
+
         let this = cx.new(|cx| {
             let replica_id = response.payload.replica_id as ReplicaId;
 
@@ -1124,7 +1131,7 @@ impl Project {
                     replica_id,
                 },
                 dap_store: dap_store.clone(),
-                git_state: None,
+                git_state,
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
@@ -1929,6 +1936,25 @@ impl Project {
     ) -> Option<Task<Result<()>>> {
         let worktree = self.worktree_for_id(worktree_id, cx)?;
         worktree.update(cx, |worktree, cx| worktree.expand_entry(entry_id, cx))
+    }
+
+    pub fn expand_all_for_entry(
+        &mut self,
+        worktree_id: WorktreeId,
+        entry_id: ProjectEntryId,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        let worktree = self.worktree_for_id(worktree_id, cx)?;
+        let task = worktree.update(cx, |worktree, cx| {
+            worktree.expand_all_for_entry(entry_id, cx)
+        });
+        Some(cx.spawn(|this, mut cx| async move {
+            task.ok_or_else(|| anyhow!("no task"))?.await?;
+            this.update(&mut cx, |_, cx| {
+                cx.emit(Event::ExpandedAllForEntry(worktree_id, entry_id));
+            })?;
+            Ok(())
+        }))
     }
 
     pub fn shared(&mut self, project_id: u64, cx: &mut Context<Self>) -> Result<()> {
