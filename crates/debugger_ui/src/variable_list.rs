@@ -61,8 +61,8 @@ pub struct SetVariableState {
     scope: Scope,
     value: String,
     stack_frame_id: u64,
+    container_reference: u64,
     evaluate_name: Option<String>,
-    parent_variables_reference: u64,
 }
 
 impl SetVariableState {
@@ -109,7 +109,7 @@ impl SetVariableState {
             value: payload.value,
             stack_frame_id: payload.stack_frame_id,
             evaluate_name: payload.evaluate_name.clone(),
-            parent_variables_reference: payload.parent_variables_reference,
+            container_reference: payload.parent_variables_reference,
         })
     }
 
@@ -120,7 +120,7 @@ impl SetVariableState {
             value: self.value.clone(),
             stack_frame_id: self.stack_frame_id,
             evaluate_name: self.evaluate_name.clone(),
-            parent_variables_reference: self.parent_variables_reference,
+            parent_variables_reference: self.container_reference,
         }
     }
 }
@@ -796,7 +796,7 @@ impl VariableList {
                 }
 
                 if let Some(state) = self.set_variable_state.as_ref() {
-                    if state.parent_variables_reference == container_reference
+                    if state.container_reference == container_reference
                         && state.scope.variables_reference == scope.variables_reference
                         && state.name == variable.name
                     {
@@ -1025,7 +1025,7 @@ impl VariableList {
 
     fn deploy_variable_context_menu(
         &mut self,
-        parent_variables_reference: u64,
+        container_reference: u64,
         scope: &Scope,
         variable: &Variable,
         position: Point<Pixels>,
@@ -1101,29 +1101,22 @@ impl VariableList {
                 },
             )
             .when(support_set_variable, |menu| {
-                let variable = variable.clone();
-                let scope = scope.clone();
-
                 menu.entry(
                     "Set value",
                     None,
-                    window.handler_for(&this, move |this, window, cx| {
-                        this.set_variable_state = Some(SetVariableState {
-                            parent_variables_reference,
-                            name: variable.name.clone(),
-                            scope: scope.clone(),
-                            evaluate_name: variable.evaluate_name.clone(),
-                            value: variable.value.clone(),
-                            stack_frame_id: this.stack_frame_list.read(cx).current_stack_frame_id(),
-                        });
+                    window.handler_for(&this, {
+                        let variable = variable.clone();
+                        let scope = scope.clone();
 
-                        this.set_variable_editor.update(cx, |editor, cx| {
-                            editor.set_text(variable.value.clone(), window, cx);
-                            editor.select_all(&SelectAll, window, cx);
-                            window.focus(&editor.focus_handle(cx))
-                        });
-
-                        this.build_entries(false, true, cx);
+                        move |this, window, cx| {
+                            this.show_set_variable_editor(
+                                variable.clone(),
+                                scope.clone(),
+                                container_reference,
+                                window,
+                                cx,
+                            );
+                        }
                     }),
                 )
             })
@@ -1145,6 +1138,32 @@ impl VariableList {
         );
 
         self.open_context_menu = Some((context_menu, position, subscription));
+    }
+
+    pub fn show_set_variable_editor(
+        &mut self,
+        variable: Variable,
+        scope: Scope,
+        container_reference: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_variable_state = Some(SetVariableState {
+            scope,
+            container_reference,
+            name: variable.name,
+            value: variable.value.clone(),
+            evaluate_name: variable.evaluate_name,
+            stack_frame_id: self.stack_frame_list.read(cx).current_stack_frame_id(),
+        });
+
+        self.set_variable_editor.update(cx, |editor, cx| {
+            editor.set_text(variable.value.clone(), window, cx);
+            editor.select_all(&SelectAll, window, cx);
+            window.focus(&editor.focus_handle(cx))
+        });
+
+        self.build_entries(false, true, cx);
     }
 
     fn cancel_set_variable_value(&mut self, cx: &mut Context<Self>) {
@@ -1171,14 +1190,14 @@ impl VariableList {
         if new_variable_value == state.value
             || state.stack_frame_id != self.stack_frame_list.read(cx).current_stack_frame_id()
         {
-            return cx.notify();
+            return self.build_entries(false, true, cx);
         }
 
         let set_value_task = self.dap_store.update(cx, |store, cx| {
             store.set_variable_value(
                 &self.client_id,
                 state.stack_frame_id,
-                state.parent_variables_reference,
+                state.container_reference,
                 state.name,
                 new_variable_value,
                 state.evaluate_name,

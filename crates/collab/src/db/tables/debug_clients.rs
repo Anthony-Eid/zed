@@ -13,6 +13,7 @@ const SUPPORTS_STEPPING_GRANULARITY_BIT: u32 = 6;
 const SUPPORTS_TERMINATE_THREADS_REQUEST_BIT: u32 = 7;
 const SUPPORTS_RESTART_FRAME_REQUEST_BIT: u32 = 8;
 const SUPPORTS_CLIPBOARD_CONTEXT_BIT: u32 = 9;
+const SUPPORTS_SET_VARIABLE_BIT: u32 = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "debug_clients")]
@@ -57,6 +58,7 @@ impl Model {
                 != 0,
             supports_clipboard_context: (self.capabilities & (1 << SUPPORTS_CLIPBOARD_CONTEXT_BIT))
                 != 0,
+            supports_set_variable: (self.capabilities & (1 << SUPPORTS_SET_VARIABLE_BIT)) != 0,
         }
     }
 
@@ -81,6 +83,9 @@ impl Model {
             << SUPPORTS_RESTART_FRAME_REQUEST_BIT;
         capabilities_bit_mask |=
             (capabilities.supports_clipboard_context as i32) << SUPPORTS_CLIPBOARD_CONTEXT_BIT;
+
+        capabilities_bit_mask |=
+            (capabilities.supports_set_variable as i32) << SUPPORTS_SET_VARIABLE_BIT;
 
         self.capabilities = capabilities_bit_mask;
     }

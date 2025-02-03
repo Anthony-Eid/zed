@@ -348,6 +348,7 @@ pub fn capabilities_from_proto(payload: &SetDebugClientCapabilities) -> Capabili
         supports_terminate_threads_request: Some(payload.supports_terminate_threads_request),
         supports_restart_frame: Some(payload.supports_restart_frame_request),
         supports_clipboard_context: Some(payload.supports_clipboard_context),
+        supports_set_variable: Some(payload.supports_set_variable),
         ..Default::default()
     }
 }
@@ -380,6 +381,7 @@ pub fn capabilities_to_proto(
             .unwrap_or_default(),
         supports_restart_frame_request: capabilities.supports_restart_frame.unwrap_or_default(),
         supports_clipboard_context: capabilities.supports_clipboard_context.unwrap_or_default(),
+        supports_set_variable: capabilities.supports_set_variable.unwrap_or_default(),
     }
 }
 
