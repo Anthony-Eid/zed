@@ -1338,9 +1338,7 @@ async fn test_variable_list(
     let (mut host_zed, mut remote_zed, mut late_join_zed) =
         setup_three_member_test(&mut server, host_cx, remote_cx, late_join_cx).await;
 
-    let (host_project_id, _worktree_id) = host_zed
-        .host_project(Some(json!({"test.txt": "one\ntwo\nthree\nfour\nfive"})))
-        .await;
+    let (host_project_id, _worktree_id) = host_zed.host_project(None).await;
 
     remote_zed.join_project(host_project_id).await;
 
