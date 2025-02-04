@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/activity_indicator",
-    "crates/zed_predict_tos",
     "crates/anthropic",
     "crates/assets",
     "crates/assistant",
@@ -32,10 +31,11 @@ members = [
     "crates/copilot",
     "crates/dap",
     "crates/dap_adapters",
+    "crates/debugger_tools",
     "crates/debugger_ui",
     "crates/db",
-    "crates/diagnostics",
     "crates/deepseek",
+    "crates/diagnostics",
     "crates/docs_preprocessor",
     "crates/editor",
     "crates/evals",
@@ -48,16 +48,17 @@ members = [
     "crates/feedback",
     "crates/file_finder",
     "crates/file_icons",
-    "crates/fireworks",
     "crates/fs",
     "crates/fsevent",
     "crates/fuzzy",
     "crates/git",
     "crates/git_hosting_providers",
+    "crates/git_ui",
     "crates/go_to_line",
     "crates/google_ai",
     "crates/gpui",
     "crates/gpui_macros",
+    "crates/gpui_tokio",
     "crates/html_to_markdown",
     "crates/http_client",
     "crates/image_viewer",
@@ -106,9 +107,11 @@ members = [
     "crates/remote_server",
     "crates/repl",
     "crates/reqwest_client",
+    "crates/reqwest_client",
     "crates/rich_text",
     "crates/rope",
     "crates/rpc",
+    "crates/schema_generator",
     "crates/search",
     "crates/semantic_index",
     "crates/semantic_version",
@@ -144,7 +147,6 @@ members = [
     "crates/ui",
     "crates/ui_input",
     "crates/ui_macros",
-    "crates/reqwest_client",
     "crates/util",
     "crates/vcs_menu",
     "crates/vim",
@@ -154,8 +156,8 @@ members = [
     "crates/worktree",
     "crates/zed",
     "crates/zed_actions",
+    "crates/zed_predict_onboarding",
     "crates/zeta",
-    "crates/git_ui",
 
     #
     # Extensions
@@ -172,7 +174,6 @@ members = [
     "extensions/lua",
     "extensions/php",
     "extensions/perplexity",
-    "extensions/prisma",
     "extensions/proto",
     "extensions/purescript",
     "extensions/ruff",
@@ -189,7 +190,6 @@ members = [
     #
 
     "tooling/xtask",
-    "crates/debugger_tools",
 ]
 default-members = ["crates/zed"]
 
@@ -205,7 +205,6 @@ edition = "2021"
 
 activity_indicator = { path = "crates/activity_indicator" }
 ai = { path = "crates/ai" }
-zed_predict_tos = { path = "crates/zed_predict_tos" }
 anthropic = { path = "crates/anthropic" }
 assets = { path = "crates/assets" }
 assistant = { path = "crates/assistant" }
@@ -248,7 +247,6 @@ feature_flags = { path = "crates/feature_flags" }
 feedback = { path = "crates/feedback" }
 file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
-fireworks = { path = "crates/fireworks" }
 fs = { path = "crates/fs" }
 fsevent = { path = "crates/fsevent" }
 fuzzy = { path = "crates/fuzzy" }
@@ -261,6 +259,7 @@ gpui = { path = "crates/gpui", default-features = false, features = [
     "http_client",
 ] }
 gpui_macros = { path = "crates/gpui_macros" }
+gpui_tokio = { path = "crates/gpui_tokio" }
 html_to_markdown = { path = "crates/html_to_markdown" }
 http_client = { path = "crates/http_client" }
 image_viewer = { path = "crates/image_viewer" }
@@ -357,6 +356,7 @@ workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
 zed = { path = "crates/zed" }
 zed_actions = { path = "crates/zed_actions" }
+zed_predict_onboarding = { path = "crates/zed_predict_onboarding" }
 zeta = { path = "crates/zeta" }
 
 #
@@ -383,9 +383,10 @@ async-watch = "0.3.1"
 async_zip = { version = "0.0.17", features = ["deflate", "deflate64"] }
 base64 = "0.22"
 bitflags = "2.6.0"
-blade-graphics = { git = "https://github.com/kvark/blade", rev = "091a8401033847bb9b6ace3fcf70448d069621c5" }
-blade-macros = { git = "https://github.com/kvark/blade", rev = "091a8401033847bb9b6ace3fcf70448d069621c5" }
-blade-util = { git = "https://github.com/kvark/blade", rev = "091a8401033847bb9b6ace3fcf70448d069621c5" }
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "b16f5c7bd873c7126f48c82c39e7ae64602ae74f" }
+blade-macros = { git = "https://github.com/kvark/blade", rev = "b16f5c7bd873c7126f48c82c39e7ae64602ae74f" }
+blade-util = { git = "https://github.com/kvark/blade", rev = "b16f5c7bd873c7126f48c82c39e7ae64602ae74f" }
+naga = { version = "23.1.0", features = ["wgsl-in"] }
 blake3 = "1.5.3"
 bytes = "1.0"
 cargo_metadata = "0.19"
@@ -430,7 +431,7 @@ jupyter-websocket-client = { version = "0.9.0" }
 libc = "0.2"
 libsqlite3-sys = { version = "0.30.1", features = ["bundled"] }
 linkify = "0.10.0"
-livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev="060964da10574cd9bf06463a53bf6e0769c5c45e", features = ["dispatcher", "services-dispatcher", "rustls-tls-native-roots"], default-features = false }
+livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev="811ceae29fabee455f110c56cd66b3f49a7e5003", features = ["dispatcher", "services-dispatcher", "rustls-tls-native-roots"], default-features = false }
 log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
 markup5ever_rcdom = "0.3.0"
 nanoid = "0.4"
@@ -472,9 +473,9 @@ runtimelib = { version = "0.25.0", default-features = false, features = [
     "async-dispatcher-runtime",
 ] }
 rustc-demangle = "0.1.23"
-rust-embed = { version = "8.5", features = ["include-exclude"] }
+rust-embed = { version = "8.4", features = ["include-exclude"] }
 rustc-hash = "2.1.0"
-rustls = "0.21.12"
+rustls = { version = "0.23.22", features = ["ring"] }
 rustls-native-certs = "0.8.0"
 schemars = { version = "0.8", features = ["impl_json_schema", "indexmap2"] }
 semver = "1.0"
@@ -532,13 +533,13 @@ tree-sitter-jsdoc = "0.23"
 tree-sitter-json = "0.24"
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 tree-sitter-python = "0.23"
-tree-sitter-regex = "0.23"
+tree-sitter-regex = "0.24"
 tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-yaml = { git = "https://github.com/zed-industries/tree-sitter-yaml", rev = "baff0b51c64ef6a1fb1f8390f3ad6015b83ec13a" }
 unicase = "2.6"
-unindent = "0.1.7"
+unindent = "0.2.0"
 unicode-segmentation = "1.10"
 unicode-script = "0.5.7"
 url = "2.2"
@@ -615,6 +616,7 @@ features = [
 # TODO livekit https://github.com/RustAudio/cpal/pull/891
 [patch.crates-io]
 cpal = { git = "https://github.com/zed-industries/cpal", rev = "fd8bc2fd39f1f5fdee5a0690656caff9a26d9d50" }
+real-async-tls = { git = "https://github.com/zed-industries/async-tls", rev = "1e759a4b5e370f87dc15e40756ac4f8815b61d9d", package = "async-tls"}
 
 [profile.dev]
 split-debuginfo = "unpacked"

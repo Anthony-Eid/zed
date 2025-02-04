@@ -20,6 +20,7 @@ use futures::{future, StreamExt};
 use git::GitHostingProviderRegistry;
 use gpui::{App, AppContext as _, Application, AsyncApp, UpdateGlobal as _};
 
+use gpui_tokio::Tokio;
 use http_client::{read_proxy_from_env, Uri};
 use language::LanguageRegistry;
 use log::LevelFilter;
@@ -279,6 +280,7 @@ fn main() {
 
     app.run(move |cx| {
         release_channel::init(app_version, cx);
+        gpui_tokio::init(cx);
         if let Some(build_sha) = option_env!("ZED_COMMIT_SHA") {
             AppCommitSha::set_global(AppCommitSha(build_sha.into()), cx);
         }
@@ -302,8 +304,11 @@ fn main() {
                     .ok()
             })
             .or_else(read_proxy_from_env);
-        let http = ReqwestClient::proxy_and_user_agent(proxy_url, &user_agent)
-            .expect("could not start HTTP client");
+        let http = {
+            let _guard = Tokio::handle(cx).enter();
+            ReqwestClient::proxy_and_user_agent(proxy_url, &user_agent)
+                .expect("could not start HTTP client")
+        };
         cx.set_http_client(Arc::new(http));
 
         <dyn Fs>::set_global(fs.clone(), cx);
@@ -373,14 +378,14 @@ fn main() {
         if let (Some(system_id), Some(installation_id)) = (&system_id, &installation_id) {
             match (&system_id, &installation_id) {
                 (IdType::New(_), IdType::New(_)) => {
-                    telemetry.report_app_event("first open".to_string());
-                    telemetry.report_app_event("first open for release channel".to_string());
+                    telemetry::event!("App First Opened");
+                    telemetry::event!("App First Opened For Release Channel");
                 }
                 (IdType::Existing(_), IdType::New(_)) => {
-                    telemetry.report_app_event("first open for release channel".to_string());
+                    telemetry::event!("App First Opened For Release Channel");
                 }
                 (_, IdType::Existing(_)) => {
-                    telemetry.report_app_event("open".to_string());
+                    telemetry::event!("App Opened");
                 }
             }
         }
@@ -436,6 +441,7 @@ fn main() {
         inline_completion_registry::init(
             app_state.client.clone(),
             app_state.user_store.clone(),
+            app_state.fs.clone(),
             cx,
         );
         let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);

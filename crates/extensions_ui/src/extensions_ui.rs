@@ -295,6 +295,25 @@ impl ExtensionsPage {
                     );
                 })
                 .ok();
+            return;
+        }
+
+        let icon_themes = extension_store
+            .extension_icon_themes(extension_id)
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        if !icon_themes.is_empty() {
+            workspace
+                .update(cx, |_workspace, cx| {
+                    window.dispatch_action(
+                        zed_actions::icon_theme_selector::Toggle {
+                            themes_filter: Some(icon_themes),
+                        }
+                        .boxed_clone(),
+                        cx,
+                    );
+                })
+                .ok();
         }
     }
 
@@ -1188,7 +1207,7 @@ impl Item for ExtensionsPage {
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
-        Some("extensions page")
+        Some("Extensions Page Opened")
     }
 
     fn show_toolbar(&self) -> bool {

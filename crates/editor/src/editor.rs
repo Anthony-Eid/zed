@@ -69,21 +69,22 @@ pub use element::{
 };
 use futures::{future, FutureExt};
 use fuzzy::StringMatchCandidate;
-use zed_predict_tos::ZedPredictTos;
+use zed_predict_onboarding::ZedPredictModal;
 
 use code_context_menus::{
     AvailableCodeAction, CodeActionContents, CodeActionsItem, CodeActionsMenu, CodeContextMenu,
-    CompletionEntry, CompletionsMenu, ContextMenuOrigin,
+    CompletionsMenu, ContextMenuOrigin,
 };
 use git::blame::GitBlame;
 use gpui::{
-    div, impl_actions, point, prelude::*, px, relative, size, Action, AnyElement, App,
-    AsyncWindowContext, AvailableSpace, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context,
-    DispatchPhase, ElementId, Entity, EntityInputHandler, EventEmitter, FocusHandle, FocusOutEvent,
-    Focusable, FontId, FontWeight, Global, HighlightStyle, Hsla, InteractiveText, KeyContext,
-    MouseButton, PaintQuad, ParentElement, Pixels, Render, SharedString, Size, Styled, StyledText,
-    Subscription, Task, TextStyle, TextStyleRefinement, UTF16Selection, UnderlineStyle,
-    UniformListScrollHandle, WeakEntity, WeakFocusHandle, Window,
+    div, impl_actions, point, prelude::*, pulsating_between, px, relative, size, Action, Animation,
+    AnimationExt, AnyElement, App, AsyncWindowContext, AvailableSpace, Bounds, ClickEvent,
+    ClipboardEntry, ClipboardItem, Context, DispatchPhase, ElementId, Entity, EntityInputHandler,
+    EventEmitter, FocusHandle, FocusOutEvent, Focusable, FontId, FontWeight, Global,
+    HighlightStyle, Hsla, InteractiveText, KeyContext, Modifiers, MouseButton, MouseDownEvent,
+    PaintQuad, ParentElement, Pixels, Render, SharedString, Size, Styled, StyledText, Subscription,
+    Task, TextStyle, TextStyleRefinement, UTF16Selection, UnderlineStyle, UniformListScrollHandle,
+    WeakEntity, WeakFocusHandle, Window,
 };
 use highlight_matching_bracket::refresh_matching_bracket_highlights;
 use hover_links::{find_file, HoverLink, HoveredLinkState, InlayHighlight};
@@ -97,9 +98,9 @@ use itertools::Itertools;
 use language::{
     language_settings::{self, all_language_settings, language_settings, InlayHintSettings},
     markdown, point_from_lsp, AutoindentMode, BracketPair, Buffer, Capability, CharKind, CodeLabel,
-    CursorShape, Diagnostic, Documentation, EditPreview, HighlightedEdits, IndentKind, IndentSize,
-    Language, OffsetRangeExt, Point, Selection, SelectionGoal, TextObject, TransactionId,
-    TreeSitterOptions,
+    CompletionDocumentation, CursorShape, Diagnostic, EditPreview, HighlightedText, IndentKind,
+    IndentSize, Language, OffsetRangeExt, Point, Selection, SelectionGoal, TextObject,
+    TransactionId, TreeSitterOptions,
 };
 use language::{point_to_lsp, BufferRow, CharClassifier, Runnable, RunnableRange};
 use linked_editing_ranges::refresh_linked_ranges;
@@ -112,7 +113,7 @@ pub use proposed_changes_editor::{
     ProposedChangeLocation, ProposedChangesEditor, ProposedChangesEditorToolbar,
 };
 use similar::{ChangeTag, TextDiff};
-use std::iter::Peekable;
+use std::iter::{self, Peekable};
 use task::{ResolvedTask, TaskTemplate, TaskVariables};
 
 pub use lsp::CompletionContext;
@@ -169,7 +170,7 @@ use ui::{
     h_flex, prelude::*, ButtonSize, ButtonStyle, Disclosure, IconButton, IconName, IconSize,
     Tooltip,
 };
-use util::{defer, maybe, post_inc, RangeExt, ResultExt, TryFutureExt};
+use util::{defer, maybe, post_inc, RangeExt, ResultExt, TakeUntilExt, TryFutureExt};
 use workspace::item::{ItemHandle, PreviewTabsSettings};
 use workspace::notifications::{DetachAndPromptErr, NotificationId, NotifyTaskExt};
 use workspace::{
@@ -339,13 +340,13 @@ pub fn init(cx: &mut App) {
                 app_state,
                 cx,
                 |workspace, window, cx| {
+                    cx.activate(true);
                     Editor::new_file(workspace, &Default::default(), window, cx)
                 },
             )
             .detach();
         }
     });
-    git::project_diff::init(cx);
 }
 
 pub struct SearchWithinRange;
@@ -472,32 +473,6 @@ pub fn make_suggestion_styles(cx: &mut App) -> InlineCompletionStyles {
 
 type CompletionId = usize;
 
-#[derive(Debug, Clone)]
-enum InlineCompletionMenuHint {
-    Loading,
-    Loaded { text: InlineCompletionText },
-    PendingTermsAcceptance,
-    None,
-}
-
-impl InlineCompletionMenuHint {
-    pub fn label(&self) -> &'static str {
-        match self {
-            InlineCompletionMenuHint::Loading | InlineCompletionMenuHint::Loaded { .. } => {
-                "Edit Prediction"
-            }
-            InlineCompletionMenuHint::PendingTermsAcceptance => "Accept Terms of Service",
-            InlineCompletionMenuHint::None => "No Prediction",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-enum InlineCompletionText {
-    Move(SharedString),
-    Edit(HighlightedEdits),
-}
-
 pub(crate) enum EditDisplayMode {
     TabAccept,
     DiffPopover,
@@ -511,13 +486,26 @@ enum InlineCompletion {
         display_mode: EditDisplayMode,
         snapshot: BufferSnapshot,
     },
-    Move(Anchor),
+    Move {
+        target: Anchor,
+        range_around_target: Range<text::Anchor>,
+        snapshot: BufferSnapshot,
+    },
 }
 
 struct InlineCompletionState {
     inlay_ids: Vec<InlayId>,
     completion: InlineCompletion,
     invalidation_range: Range<Anchor>,
+}
+
+impl InlineCompletionState {
+    pub fn is_move(&self) -> bool {
+        match &self.completion {
+            InlineCompletion::Move { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 enum InlineCompletionHighlight {}
@@ -689,11 +677,14 @@ pub struct Editor {
     leader_peer_id: Option<PeerId>,
     remote_id: Option<ViewId>,
     hover_state: HoverState,
+    pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     gutter_hovered: bool,
     hovered_link_state: Option<HoveredLinkState>,
     inline_completion_provider: Option<RegisteredInlineCompletionProvider>,
     code_action_providers: Vec<Rc<dyn CodeActionProvider>>,
     active_inline_completion: Option<InlineCompletionState>,
+    /// Used to prevent flickering as the user types while the menu is open
+    stale_inline_completion_in_menu: Option<InlineCompletionState>,
     // enable_inline_completions is a switch that Vim can use to disable
     // inline completions based on its mode.
     enable_inline_completions: bool,
@@ -740,6 +731,7 @@ pub struct Editor {
     /// It should be None while a user is not hovering over the gutter
     /// Otherwise it represents the point that the breakpoint will be shown
     pub gutter_breakpoint_indicator: Option<DisplayPoint>,
+    in_project_search: bool,
     previous_search_ranges: Option<Arc<[Range<Anchor>]>>,
     breadcrumb_header: Option<String>,
     focused_block: Option<FocusedBlock>,
@@ -1395,9 +1387,11 @@ impl Editor {
             leader_peer_id: None,
             remote_id: None,
             hover_state: Default::default(),
+            pending_mouse_down: None,
             hovered_link_state: Default::default(),
             inline_completion_provider: None,
             active_inline_completion: None,
+            stale_inline_completion_in_menu: None,
             inlay_hint_cache: InlayHintCache::new(inlay_hint_settings),
 
             gutter_hovered: false,
@@ -1446,6 +1440,7 @@ impl Editor {
             ],
             tasks_update_task: None,
             linked_edit_ranges: Default::default(),
+            in_project_search: false,
             previous_search_ranges: None,
             breadcrumb_header: None,
             focused_block: None,
@@ -1516,7 +1511,7 @@ impl Editor {
         match self.context_menu.borrow().as_ref() {
             Some(CodeContextMenu::Completions(_)) => {
                 key_context.add("menu");
-                key_context.add("showing_completions")
+                key_context.add("showing_completions");
             }
             Some(CodeContextMenu::CodeActions(_)) => {
                 key_context.add("menu");
@@ -1723,6 +1718,10 @@ impl Editor {
 
     pub fn set_collaboration_hub(&mut self, hub: Box<dyn CollaborationHub>) {
         self.collaboration_hub = Some(hub);
+    }
+
+    pub fn set_in_project_search(&mut self, in_project_search: bool) {
+        self.in_project_search = in_project_search;
     }
 
     pub fn set_custom_context_menu(
@@ -2627,9 +2626,6 @@ impl Editor {
         }
 
         if self.hide_context_menu(window, cx).is_some() {
-            if self.show_inline_completions_in_menu(cx) && self.has_active_inline_completion() {
-                self.update_visible_inline_completion(window, cx);
-            }
             return true;
         }
 
@@ -3617,10 +3613,11 @@ impl Editor {
                 } else {
                     self.inlay_hint_cache.clear();
                     self.splice_inlays(
-                        self.visible_inlay_hints(cx)
+                        &self
+                            .visible_inlay_hints(cx)
                             .iter()
                             .map(|inlay| inlay.id)
-                            .collect(),
+                            .collect::<Vec<InlayId>>(),
                         Vec::new(),
                         cx,
                     );
@@ -3638,7 +3635,7 @@ impl Editor {
                         to_remove,
                         to_insert,
                     })) => {
-                        self.splice_inlays(to_remove, to_insert, cx);
+                        self.splice_inlays(&to_remove, to_insert, cx);
                         return;
                     }
                     ControlFlow::Break(None) => return,
@@ -3651,7 +3648,7 @@ impl Editor {
                     to_insert,
                 }) = self.inlay_hint_cache.remove_excerpts(excerpts_removed)
                 {
-                    self.splice_inlays(to_remove, to_insert, cx);
+                    self.splice_inlays(&to_remove, to_insert, cx);
                 }
                 return;
             }
@@ -3674,7 +3671,7 @@ impl Editor {
             ignore_debounce,
             cx,
         ) {
-            self.splice_inlays(to_remove, to_insert, cx);
+            self.splice_inlays(&to_remove, to_insert, cx);
         }
     }
 
@@ -3754,7 +3751,7 @@ impl Editor {
 
     pub fn splice_inlays(
         &self,
-        to_remove: Vec<InlayId>,
+        to_remove: &[InlayId],
         to_insert: Vec<Inlay>,
         cx: &mut Context<Self>,
     ) {
@@ -3921,16 +3918,14 @@ impl Editor {
                         let mut menu = menu.unwrap();
                         menu.resolve_visible_completions(editor.completion_provider.as_deref(), cx);
 
+                        *editor.context_menu.borrow_mut() =
+                            Some(CodeContextMenu::Completions(menu));
+
                         if editor.show_inline_completions_in_menu(cx) {
-                            if let Some(hint) = editor.inline_completion_menu_hint(window, cx) {
-                                menu.show_inline_completion_hint(hint);
-                            }
+                            editor.update_visible_inline_completion(window, cx);
                         } else {
                             editor.discard_inline_completion(false, cx);
                         }
-
-                        *editor.context_menu.borrow_mut() =
-                            Some(CodeContextMenu::Completions(menu));
 
                         cx.notify();
                     } else if editor.completion_tasks.len() <= 1 {
@@ -3972,12 +3967,21 @@ impl Editor {
         self.do_completion(action.item_ix, CompletionIntent::Compose, window, cx)
     }
 
-    fn toggle_zed_predict_tos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_zed_predict_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(workspace), Some(project)) = (self.workspace(), self.project.as_ref()) else {
             return;
         };
 
-        ZedPredictTos::toggle(workspace, project.read(cx).user_store().clone(), window, cx);
+        let project = project.read(cx);
+
+        ZedPredictModal::toggle(
+            workspace,
+            project.user_store().clone(),
+            project.client().clone(),
+            project.fs().clone(),
+            window,
+            cx,
+        );
     }
 
     fn do_completion(
@@ -3989,34 +3993,6 @@ impl Editor {
     ) -> Option<Task<std::result::Result<(), anyhow::Error>>> {
         use language::ToOffset as _;
 
-        {
-            let context_menu = self.context_menu.borrow();
-            if let CodeContextMenu::Completions(menu) = context_menu.as_ref()? {
-                let entries = menu.entries.borrow();
-                let entry = entries.get(item_ix.unwrap_or(menu.selected_item));
-                match entry {
-                    Some(CompletionEntry::InlineCompletionHint(
-                        InlineCompletionMenuHint::Loading,
-                    )) => return Some(Task::ready(Ok(()))),
-                    Some(CompletionEntry::InlineCompletionHint(InlineCompletionMenuHint::None)) => {
-                        drop(entries);
-                        drop(context_menu);
-                        self.context_menu_next(&Default::default(), window, cx);
-                        return Some(Task::ready(Ok(())));
-                    }
-                    Some(CompletionEntry::InlineCompletionHint(
-                        InlineCompletionMenuHint::PendingTermsAcceptance,
-                    )) => {
-                        drop(entries);
-                        drop(context_menu);
-                        self.toggle_zed_predict_tos(window, cx);
-                        return Some(Task::ready(Ok(())));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
         let completions_menu =
             if let CodeContextMenu::Completions(menu) = self.hide_context_menu(window, cx)? {
                 menu
@@ -4026,19 +4002,9 @@ impl Editor {
 
         let entries = completions_menu.entries.borrow();
         let mat = entries.get(item_ix.unwrap_or(completions_menu.selected_item))?;
-        let mat = match mat {
-            CompletionEntry::InlineCompletionHint(_) => {
-                self.accept_inline_completion(&AcceptInlineCompletion, window, cx);
-                cx.stop_propagation();
-                return Some(Task::ready(Ok(())));
-            }
-            CompletionEntry::Match(mat) => {
-                if self.show_inline_completions_in_menu(cx) {
-                    self.discard_inline_completion(true, cx);
-                }
-                mat
-            }
-        };
+        if self.show_inline_completions_in_menu(cx) {
+            self.discard_inline_completion(true, cx);
+        }
         let candidate_id = mat.candidate_id;
         drop(entries);
 
@@ -4659,7 +4625,7 @@ impl Editor {
                     let mut read_ranges = Vec::new();
                     for highlight in highlights {
                         for (excerpt_id, excerpt_range) in
-                            buffer.excerpts_for_buffer(&cursor_buffer, cx)
+                            buffer.excerpts_for_buffer(cursor_buffer.read(cx).remote_id(), cx)
                         {
                             let start = highlight
                                 .range
@@ -4765,6 +4731,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.inline_completions_enabled(cx) {
+            return;
+        }
+
         if !self.has_active_inline_completion() {
             self.refresh_inline_completion(false, true, window, cx);
             return;
@@ -4866,10 +4836,10 @@ impl Editor {
         self.report_inline_completion_event(true, cx);
 
         match &active_inline_completion.completion {
-            InlineCompletion::Move(position) => {
-                let position = *position;
+            InlineCompletion::Move { target, .. } => {
+                let target = *target;
                 self.change_selections(Some(Autoscroll::newest()), window, cx, |selections| {
-                    selections.select_anchor_ranges([position..position]);
+                    selections.select_anchor_ranges([target..target]);
                 });
             }
             InlineCompletion::Edit { edits, .. } => {
@@ -4914,10 +4884,10 @@ impl Editor {
         self.report_inline_completion_event(true, cx);
 
         match &active_inline_completion.completion {
-            InlineCompletion::Move(position) => {
-                let position = *position;
+            InlineCompletion::Move { target, .. } => {
+                let target = *target;
                 self.change_selections(Some(Autoscroll::newest()), window, cx, |selections| {
-                    selections.select_anchor_ranges([position..position]);
+                    selections.select_anchor_ranges([target..target]);
                 });
             }
             InlineCompletion::Edit { edits, .. } => {
@@ -4976,7 +4946,7 @@ impl Editor {
             provider.discard(cx);
         }
 
-        self.take_active_inline_completion(cx).is_some()
+        self.take_active_inline_completion(cx)
     }
 
     fn report_inline_completion_event(&self, accepted: bool, cx: &App) {
@@ -5013,19 +4983,58 @@ impl Editor {
         self.active_inline_completion.is_some()
     }
 
-    fn take_active_inline_completion(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Option<InlineCompletion> {
-        let active_inline_completion = self.active_inline_completion.take()?;
-        self.splice_inlays(active_inline_completion.inlay_ids, Default::default(), cx);
+    fn take_active_inline_completion(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(active_inline_completion) = self.active_inline_completion.take() else {
+            return false;
+        };
+
+        self.splice_inlays(&active_inline_completion.inlay_ids, Default::default(), cx);
         self.clear_highlights::<InlineCompletionHighlight>(cx);
-        Some(active_inline_completion.completion)
+        self.stale_inline_completion_in_menu = Some(active_inline_completion);
+        true
+    }
+
+    fn update_inline_completion_preview(
+        &mut self,
+        modifiers: &Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Moves jump directly with a preview step
+
+        if self
+            .active_inline_completion
+            .as_ref()
+            .map_or(true, |c| c.is_move())
+        {
+            cx.notify();
+            return;
+        }
+
+        if !self.show_inline_completions_in_menu(cx) {
+            return;
+        }
+
+        let mut menu_borrow = self.context_menu.borrow_mut();
+
+        let Some(CodeContextMenu::Completions(completions_menu)) = menu_borrow.as_mut() else {
+            return;
+        };
+
+        if completions_menu.is_empty()
+            || completions_menu.previewing_inline_completion == modifiers.alt
+        {
+            return;
+        }
+
+        completions_menu.set_previewing_inline_completion(modifiers.alt);
+        drop(menu_borrow);
+        self.update_visible_inline_completion(window, cx);
     }
 
     fn update_visible_inline_completion(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let selection = self.selections.newest_anchor();
@@ -5034,7 +5043,8 @@ impl Editor {
         let offset_selection = selection.map(|endpoint| endpoint.to_offset(&multibuffer));
         let excerpt_id = cursor.excerpt_id;
 
-        let completions_menu_has_precedence = !self.show_inline_completions_in_menu(cx)
+        let show_in_menu = self.show_inline_completions_in_menu(cx);
+        let completions_menu_has_precedence = !show_in_menu
             && (self.context_menu.borrow().is_some()
                 || (!self.completion_tasks.is_empty() && !self.has_active_inline_completion()));
         if completions_menu_has_precedence
@@ -5083,50 +5093,73 @@ impl Editor {
 
         let cursor_row = cursor.to_point(&multibuffer).row;
 
+        let snapshot = multibuffer.buffer_for_excerpt(excerpt_id).cloned()?;
+
         let mut inlay_ids = Vec::new();
         let invalidation_row_range;
-        let completion = if cursor_row < edit_start_row {
-            invalidation_row_range = cursor_row..edit_end_row;
-            InlineCompletion::Move(first_edit_start)
+        let move_invalidation_row_range = if cursor_row < edit_start_row {
+            Some(cursor_row..edit_end_row)
         } else if cursor_row > edit_end_row {
-            invalidation_row_range = edit_start_row..cursor_row;
-            InlineCompletion::Move(first_edit_start)
+            Some(edit_start_row..cursor_row)
         } else {
-            if edits
-                .iter()
-                .all(|(range, _)| range.to_offset(&multibuffer).is_empty())
-            {
-                let mut inlays = Vec::new();
-                for (range, new_text) in &edits {
-                    let inlay = Inlay::inline_completion(
-                        post_inc(&mut self.next_inlay_id),
-                        range.start,
-                        new_text.as_str(),
-                    );
-                    inlay_ids.push(inlay.id);
-                    inlays.push(inlay);
-                }
+            None
+        };
+        let completion = if let Some(move_invalidation_row_range) = move_invalidation_row_range {
+            invalidation_row_range = move_invalidation_row_range;
+            let target = first_edit_start;
+            let target_point = text::ToPoint::to_point(&target.text_anchor, &snapshot);
+            // TODO: Base this off of TreeSitter or word boundaries?
+            let target_excerpt_begin = snapshot.anchor_before(snapshot.clip_point(
+                Point::new(target_point.row, target_point.column.saturating_sub(10)),
+                Bias::Left,
+            ));
+            let target_excerpt_end = snapshot.anchor_after(snapshot.clip_point(
+                Point::new(target_point.row, target_point.column + 10),
+                Bias::Right,
+            ));
+            // TODO: Extend this to be before the jump target, and draw a cursor at the jump target
+            // (using Editor::current_user_player_color).
+            let range_around_target = target_excerpt_begin..target_excerpt_end;
+            InlineCompletion::Move {
+                target,
+                range_around_target,
+                snapshot,
+            }
+        } else {
+            if !show_in_menu || !self.has_active_completions_menu() {
+                if edits
+                    .iter()
+                    .all(|(range, _)| range.to_offset(&multibuffer).is_empty())
+                {
+                    let mut inlays = Vec::new();
+                    for (range, new_text) in &edits {
+                        let inlay = Inlay::inline_completion(
+                            post_inc(&mut self.next_inlay_id),
+                            range.start,
+                            new_text.as_str(),
+                        );
+                        inlay_ids.push(inlay.id);
+                        inlays.push(inlay);
+                    }
 
-                self.splice_inlays(vec![], inlays, cx);
-            } else {
-                let background_color = cx.theme().status().deleted_background;
-                self.highlight_text::<InlineCompletionHighlight>(
-                    edits.iter().map(|(range, _)| range.clone()).collect(),
-                    HighlightStyle {
-                        background_color: Some(background_color),
-                        ..Default::default()
-                    },
-                    cx,
-                );
+                    self.splice_inlays(&[], inlays, cx);
+                } else {
+                    let background_color = cx.theme().status().deleted_background;
+                    self.highlight_text::<InlineCompletionHighlight>(
+                        edits.iter().map(|(range, _)| range.clone()).collect(),
+                        HighlightStyle {
+                            background_color: Some(background_color),
+                            ..Default::default()
+                        },
+                        cx,
+                    );
+                }
             }
 
             invalidation_row_range = edit_start_row..edit_end_row;
 
             let display_mode = if all_edits_insertions_or_deletions(&edits, &multibuffer) {
-                if provider.show_tab_accept_marker()
-                    && first_edit_start_point.row == last_edit_end_point.row
-                    && !edits.iter().any(|(_, edit)| edit.contains('\n'))
-                {
+                if provider.show_tab_accept_marker() {
                     EditDisplayMode::TabAccept
                 } else {
                     EditDisplayMode::Inline
@@ -5134,8 +5167,6 @@ impl Editor {
             } else {
                 EditDisplayMode::DiffPopover
             };
-
-            let snapshot = multibuffer.buffer_for_excerpt(excerpt_id).cloned()?;
 
             InlineCompletion::Edit {
                 edits,
@@ -5152,67 +5183,16 @@ impl Editor {
                 multibuffer.line_len(MultiBufferRow(invalidation_row_range.end)),
             ));
 
+        self.stale_inline_completion_in_menu = None;
         self.active_inline_completion = Some(InlineCompletionState {
             inlay_ids,
             completion,
             invalidation_range,
         });
 
-        if self.show_inline_completions_in_menu(cx) && self.has_active_completions_menu() {
-            if let Some(hint) = self.inline_completion_menu_hint(window, cx) {
-                match self.context_menu.borrow_mut().as_mut() {
-                    Some(CodeContextMenu::Completions(menu)) => {
-                        menu.show_inline_completion_hint(hint);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
         cx.notify();
 
         Some(())
-    }
-
-    fn inline_completion_menu_hint(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<InlineCompletionMenuHint> {
-        let provider = self.inline_completion_provider()?;
-        if self.has_active_inline_completion() {
-            let editor_snapshot = self.snapshot(window, cx);
-
-            let text = match &self.active_inline_completion.as_ref()?.completion {
-                InlineCompletion::Edit {
-                    edits,
-                    edit_preview,
-                    display_mode: _,
-                    snapshot,
-                } => edit_preview
-                    .as_ref()
-                    .and_then(|edit_preview| {
-                        inline_completion_edit_text(&snapshot, &edits, edit_preview, true, cx)
-                    })
-                    .map(InlineCompletionText::Edit),
-                InlineCompletion::Move(target) => {
-                    let target_point =
-                        target.to_point(&editor_snapshot.display_snapshot.buffer_snapshot);
-                    let target_line = target_point.row + 1;
-                    Some(InlineCompletionText::Move(
-                        format!("Jump to edit in line {}", target_line).into(),
-                    ))
-                }
-            };
-
-            Some(InlineCompletionMenuHint::Loaded { text: text? })
-        } else if provider.is_refreshing(cx) {
-            Some(InlineCompletionMenuHint::Loading)
-        } else if provider.needs_terms_acceptance(cx) {
-            Some(InlineCompletionMenuHint::PendingTermsAcceptance)
-        } else {
-            Some(InlineCompletionMenuHint::None)
-        }
     }
 
     pub fn inline_completion_provider(&self) -> Option<Arc<dyn InlineCompletionProviderHandle>> {
@@ -5413,7 +5393,6 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Entity<ui::ContextMenu> {
         let weak_editor = cx.weak_entity();
-        let weak_editor2 = weak_editor.clone();
         let focus_handle = self.focus_handle(cx);
 
         let second_entry_msg = if kind.log_message().is_some() {
@@ -5425,20 +5404,23 @@ impl Editor {
         ui::ContextMenu::build(window, cx, |menu, _, _cx| {
             menu.on_blur_subscription(Subscription::new(|| {}))
                 .context(focus_handle)
-                .entry("Toggle Breakpoint", None, move |_window, cx| {
-                    weak_editor
-                        .update(cx, |this, cx| {
-                            this.edit_breakpoint_at_anchor(
-                                anchor,
-                                BreakpointKind::Standard,
-                                BreakpointEditAction::Toggle,
-                                cx,
-                            );
-                        })
-                        .log_err();
+                .entry("Toggle Breakpoint", None, {
+                    let weak_editor = weak_editor.clone();
+                    move |_window, cx| {
+                        weak_editor
+                            .update(cx, |this, cx| {
+                                this.edit_breakpoint_at_anchor(
+                                    anchor,
+                                    BreakpointKind::Standard,
+                                    BreakpointEditAction::Toggle,
+                                    cx,
+                                );
+                            })
+                            .log_err();
+                    }
                 })
                 .entry(second_entry_msg, None, move |window, cx| {
-                    weak_editor2
+                    weak_editor
                         .update(cx, |this, cx| {
                             this.add_edit_breakpoint_block(row, anchor, kind.as_ref(), window, cx);
                         })
@@ -5675,7 +5657,6 @@ impl Editor {
             }))
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn context_menu_visible(&self) -> bool {
         self.context_menu
             .borrow()
@@ -5683,26 +5664,300 @@ impl Editor {
             .map_or(false, |menu| menu.visible())
     }
 
-    #[cfg(feature = "test-support")]
-    pub fn context_menu_contains_inline_completion(&self) -> bool {
+    fn context_menu_origin(&self) -> Option<ContextMenuOrigin> {
         self.context_menu
             .borrow()
             .as_ref()
-            .map_or(false, |menu| match menu {
-                CodeContextMenu::Completions(menu) => {
-                    menu.entries.borrow().first().map_or(false, |entry| {
-                        matches!(entry, CompletionEntry::InlineCompletionHint(_))
-                    })
-                }
-                CodeContextMenu::CodeActions(_) => false,
-            })
+            .map(|menu| menu.origin())
     }
 
-    fn context_menu_origin(&self, cursor_position: DisplayPoint) -> Option<ContextMenuOrigin> {
-        self.context_menu
-            .borrow()
-            .as_ref()
-            .map(|menu| menu.origin(cursor_position))
+    fn edit_prediction_cursor_popover_height(&self) -> Pixels {
+        px(32.)
+    }
+
+    fn current_user_player_color(&self, cx: &mut App) -> PlayerColor {
+        if self.read_only(cx) {
+            cx.theme().players().read_only()
+        } else {
+            self.style.as_ref().unwrap().local_player
+        }
+    }
+
+    fn render_edit_prediction_cursor_popover(
+        &self,
+        max_width: Pixels,
+        cursor_point: Point,
+        style: &EditorStyle,
+        accept_keystroke: &gpui::Keystroke,
+        window: &Window,
+        cx: &mut Context<Editor>,
+    ) -> Option<AnyElement> {
+        let provider = self.inline_completion_provider.as_ref()?;
+
+        if provider.provider.needs_terms_acceptance(cx) {
+            return Some(
+                h_flex()
+                    .h(self.edit_prediction_cursor_popover_height())
+                    .flex_1()
+                    .px_2()
+                    .gap_3()
+                    .elevation_2(cx)
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .id("accept-terms")
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        cx.stop_propagation();
+                        this.toggle_zed_predict_onboarding(window, cx)
+                    }))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(Icon::new(IconName::ZedPredict))
+                            .child(Label::new("Accept Terms of Service"))
+                            .child(div().w_full())
+                            .child(Icon::new(IconName::ArrowUpRight))
+                            .into_any_element(),
+                    )
+                    .into_any(),
+            );
+        }
+
+        let is_refreshing = provider.provider.is_refreshing(cx);
+
+        fn pending_completion_container() -> Div {
+            h_flex().gap_3().child(Icon::new(IconName::ZedPredict))
+        }
+
+        let completion = match &self.active_inline_completion {
+            Some(completion) => self.render_edit_prediction_cursor_popover_preview(
+                completion,
+                cursor_point,
+                style,
+                cx,
+            )?,
+
+            None if is_refreshing => match &self.stale_inline_completion_in_menu {
+                Some(stale_completion) => self.render_edit_prediction_cursor_popover_preview(
+                    stale_completion,
+                    cursor_point,
+                    style,
+                    cx,
+                )?,
+
+                None => {
+                    pending_completion_container().child(Label::new("...").size(LabelSize::Small))
+                }
+            },
+
+            None => pending_completion_container().child(Label::new("No Prediction")),
+        };
+
+        let buffer_font = theme::ThemeSettings::get_global(cx).buffer_font.clone();
+        let completion = completion.font(buffer_font.clone());
+
+        let completion = if is_refreshing {
+            completion
+                .with_animation(
+                    "loading-completion",
+                    Animation::new(Duration::from_secs(2))
+                        .repeat()
+                        .with_easing(pulsating_between(0.4, 0.8)),
+                    |label, delta| label.opacity(delta),
+                )
+                .into_any_element()
+        } else {
+            completion.into_any_element()
+        };
+
+        let has_completion = self.active_inline_completion.is_some();
+
+        Some(
+            h_flex()
+                .h(self.edit_prediction_cursor_popover_height())
+                .max_w(max_width)
+                .flex_1()
+                .px_2()
+                .gap_3()
+                .elevation_2(cx)
+                .child(completion)
+                .child(div().w_full())
+                .child(
+                    h_flex()
+                        .border_l_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .pl_2()
+                        .child(
+                            h_flex()
+                                .font(buffer_font.clone())
+                                .p_1()
+                                .rounded_sm()
+                                .children(ui::render_modifiers(
+                                    &accept_keystroke.modifiers,
+                                    PlatformStyle::platform(),
+                                    if window.modifiers() == accept_keystroke.modifiers {
+                                        Some(Color::Accent)
+                                    } else {
+                                        None
+                                    },
+                                )),
+                        )
+                        .opacity(if has_completion { 1.0 } else { 0.1 })
+                        .child(
+                            if self
+                                .active_inline_completion
+                                .as_ref()
+                                .map_or(false, |c| c.is_move())
+                            {
+                                div()
+                                    .child(ui::Key::new(&accept_keystroke.key, None))
+                                    .font(buffer_font.clone())
+                                    .into_any()
+                            } else {
+                                Label::new("Preview").color(Color::Muted).into_any_element()
+                            },
+                        ),
+                )
+                .into_any(),
+        )
+    }
+
+    fn render_edit_prediction_cursor_popover_preview(
+        &self,
+        completion: &InlineCompletionState,
+        cursor_point: Point,
+        style: &EditorStyle,
+        cx: &mut Context<Editor>,
+    ) -> Option<Div> {
+        use text::ToPoint as _;
+
+        fn render_relative_row_jump(
+            prefix: impl Into<String>,
+            current_row: u32,
+            target_row: u32,
+        ) -> Div {
+            let (row_diff, arrow) = if target_row < current_row {
+                (current_row - target_row, IconName::ArrowUp)
+            } else {
+                (target_row - current_row, IconName::ArrowDown)
+            };
+
+            h_flex()
+                .child(
+                    Label::new(format!("{}{}", prefix.into(), row_diff))
+                        .color(Color::Muted)
+                        .size(LabelSize::Small),
+                )
+                .child(Icon::new(arrow).color(Color::Muted).size(IconSize::Small))
+        }
+
+        match &completion.completion {
+            InlineCompletion::Edit {
+                edits,
+                edit_preview,
+                snapshot,
+                display_mode: _,
+            } => {
+                let first_edit_row = edits.first()?.0.start.text_anchor.to_point(&snapshot).row;
+
+                let highlighted_edits = crate::inline_completion_edit_text(
+                    &snapshot,
+                    &edits,
+                    edit_preview.as_ref()?,
+                    true,
+                    cx,
+                );
+
+                let len_total = highlighted_edits.text.len();
+                let first_line = &highlighted_edits.text
+                    [..highlighted_edits.text.find('\n').unwrap_or(len_total)];
+                let first_line_len = first_line.len();
+
+                let first_highlight_start = highlighted_edits
+                    .highlights
+                    .first()
+                    .map_or(0, |(range, _)| range.start);
+                let drop_prefix_len = first_line
+                    .char_indices()
+                    .find(|(_, c)| !c.is_whitespace())
+                    .map_or(first_highlight_start, |(ix, _)| {
+                        ix.min(first_highlight_start)
+                    });
+
+                let preview_text = &first_line[drop_prefix_len..];
+                let preview_len = preview_text.len();
+                let highlights = highlighted_edits
+                    .highlights
+                    .into_iter()
+                    .take_until(|(range, _)| range.start > first_line_len)
+                    .map(|(range, style)| {
+                        (
+                            range.start - drop_prefix_len
+                                ..(range.end - drop_prefix_len).min(preview_len),
+                            style,
+                        )
+                    });
+
+                let styled_text = gpui::StyledText::new(SharedString::new(preview_text))
+                    .with_highlights(&style.text, highlights);
+
+                let preview = h_flex()
+                    .gap_1()
+                    .child(styled_text)
+                    .when(len_total > first_line_len, |parent| parent.child("…"));
+
+                let left = if first_edit_row != cursor_point.row {
+                    render_relative_row_jump("", cursor_point.row, first_edit_row)
+                        .into_any_element()
+                } else {
+                    Icon::new(IconName::ZedPredict).into_any_element()
+                };
+
+                Some(h_flex().gap_3().child(left).child(preview))
+            }
+
+            InlineCompletion::Move {
+                target,
+                range_around_target,
+                snapshot,
+            } => {
+                let mut highlighted_text = snapshot.highlighted_text_for_range(
+                    range_around_target.clone(),
+                    None,
+                    &style.syntax,
+                );
+                let cursor_color = self.current_user_player_color(cx).cursor;
+                let target_offset =
+                    text::ToOffset::to_offset(&target.text_anchor, &snapshot).saturating_sub(
+                        text::ToOffset::to_offset(&range_around_target.start, &snapshot),
+                    );
+                highlighted_text.highlights = gpui::combine_highlights(
+                    highlighted_text.highlights,
+                    iter::once((
+                        target_offset..target_offset + 1,
+                        HighlightStyle {
+                            background_color: Some(cursor_color),
+                            ..Default::default()
+                        },
+                    )),
+                )
+                .collect::<Vec<_>>();
+
+                Some(
+                    h_flex()
+                        .gap_3()
+                        .child(render_relative_row_jump(
+                            "Jump ",
+                            cursor_point.row,
+                            target.text_anchor.to_point(&snapshot).row,
+                        ))
+                        .when(!highlighted_text.text.is_empty(), |parent| {
+                            parent.child(highlighted_text.to_styled_text(&style.text))
+                        }),
+                )
+            }
+        }
     }
 
     fn render_context_menu(
@@ -5713,13 +5968,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Option<AnyElement> {
-        self.context_menu.borrow().as_ref().and_then(|menu| {
-            if menu.visible() {
-                Some(menu.render(style, max_height_in_lines, y_flipped, window, cx))
-            } else {
-                None
-            }
-        })
+        let menu = self.context_menu.borrow();
+        let menu = menu.as_ref()?;
+        if !menu.visible() {
+            return None;
+        };
+        Some(menu.render(style, max_height_in_lines, y_flipped, window, cx))
     }
 
     fn render_context_menu_aside(
@@ -5750,7 +6004,8 @@ impl Editor {
         cx.notify();
         self.completion_tasks.clear();
         let context_menu = self.context_menu.borrow_mut().take();
-        if context_menu.is_some() && !self.show_inline_completions_in_menu(cx) {
+        self.stale_inline_completion_in_menu.take();
+        if context_menu.is_some() {
             self.update_visible_inline_completion(window, cx);
         }
         context_menu
@@ -9298,6 +9553,12 @@ impl Editor {
             }
         }
 
+        let reversed = self.selections.oldest::<usize>(cx).reversed;
+
+        for selection in new_selections.iter_mut() {
+            selection.reversed = reversed;
+        }
+
         select_next_state.done = true;
         self.unfold_ranges(
             &new_selections
@@ -12227,10 +12488,7 @@ impl Editor {
         if self.buffer().read(cx).is_singleton() || self.is_buffer_folded(buffer_id, cx) {
             return;
         }
-        let Some(buffer) = self.buffer().read(cx).buffer(buffer_id) else {
-            return;
-        };
-        let folded_excerpts = self.buffer().read(cx).excerpts_for_buffer(&buffer, cx);
+        let folded_excerpts = self.buffer().read(cx).excerpts_for_buffer(buffer_id, cx);
         self.display_map
             .update(cx, |display_map, cx| display_map.fold_buffer(buffer_id, cx));
         cx.emit(EditorEvent::BufferFoldToggled {
@@ -12244,10 +12502,7 @@ impl Editor {
         if self.buffer().read(cx).is_singleton() || !self.is_buffer_folded(buffer_id, cx) {
             return;
         }
-        let Some(buffer) = self.buffer().read(cx).buffer(buffer_id) else {
-            return;
-        };
-        let unfolded_excerpts = self.buffer().read(cx).excerpts_for_buffer(&buffer, cx);
+        let unfolded_excerpts = self.buffer().read(cx).excerpts_for_buffer(buffer_id, cx);
         self.display_map.update(cx, |display_map, cx| {
             display_map.unfold_buffer(buffer_id, cx);
         });
@@ -12540,6 +12795,10 @@ impl Editor {
         self.buffer.read(cx).read(cx).text()
     }
 
+    pub fn is_empty(&self, cx: &App) -> bool {
+        self.buffer.read(cx).read(cx).is_empty()
+    }
+
     pub fn text_option(&self, cx: &App) -> Option<String> {
         let text = self.text(cx);
         let text = text.trim();
@@ -12650,6 +12909,10 @@ impl Editor {
     pub(crate) fn set_wrap_width(&self, width: Option<Pixels>, cx: &mut App) -> bool {
         self.display_map
             .update(cx, |map, cx| map.set_wrap_width(width, cx))
+    }
+
+    pub fn set_soft_wrap(&mut self) {
+        self.soft_wrap_mode_override = Some(language_settings::SoftWrap::EditorWidth)
     }
 
     pub fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, _: &mut Window, cx: &mut Context<Self>) {
@@ -14651,13 +14914,7 @@ impl Editor {
         let font_id = window.text_system().resolve_font(&style.text.font());
         let font_size = style.text.font_size.to_pixels(window.rem_size());
         let line_height = style.text.line_height_in_pixels(window.rem_size());
-
-        let em_width = window
-            .text_system()
-            .typographic_bounds(font_id, font_size, 'm')
-            .unwrap()
-            .size
-            .width;
+        let em_width = window.text_system().em_width(font_id, font_size).unwrap();
 
         gpui::Point::new(em_width, line_height)
     }
@@ -15256,7 +15513,10 @@ fn snippet_completions(
                         filter_range: 0..matching_prefix.len(),
                     },
                     server_id: LanguageServerId(usize::MAX),
-                    documentation: snippet.description.clone().map(Documentation::SingleLine),
+                    documentation: snippet
+                        .description
+                        .clone()
+                        .map(CompletionDocumentation::SingleLine),
                     lsp_completion: lsp::CompletionItem {
                         label: snippet.prefix.first().unwrap().clone(),
                         kind: Some(CompletionItemKind::SNIPPET),
@@ -15622,15 +15882,16 @@ impl EditorSnapshot {
         &self,
         font_id: FontId,
         font_size: Pixels,
-        em_width: Pixels,
-        em_advance: Pixels,
         max_line_number_width: Pixels,
         cx: &App,
-    ) -> GutterDimensions {
+    ) -> Option<GutterDimensions> {
         if !self.show_gutter {
-            return GutterDimensions::default();
+            return None;
         }
+
         let descent = cx.text_system().descent(font_id, font_size);
+        let em_width = cx.text_system().em_width(font_id, font_size).log_err()?;
+        let em_advance = cx.text_system().em_advance(font_id, font_size).log_err()?;
 
         let show_git_gutter = self.show_git_diff_gutter.unwrap_or_else(|| {
             matches!(
@@ -15659,13 +15920,16 @@ impl EditorSnapshot {
         let git_blame_entries_width =
             self.git_blame_gutter_max_author_length
                 .map(|max_author_length| {
-                    // Length of the author name, but also space for the commit hash,
-                    // the spacing and the timestamp.
+                    const MAX_RELATIVE_TIMESTAMP: &str = "60 minutes ago";
+
+                    /// The number of characters to dedicate to gaps and margins.
+                    const SPACING_WIDTH: usize = 4;
+
                     let max_char_count = max_author_length
                         .min(GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED)
-                        + 7 // length of commit sha
-                        + 14 // length of max relative timestamp ("60 minutes ago")
-                        + 4; // gaps and margins
+                        + ::git::SHORT_SHA_LENGTH
+                        + MAX_RELATIVE_TIMESTAMP.len()
+                        + SPACING_WIDTH;
 
                     em_advance * max_char_count
                 });
@@ -15691,13 +15955,13 @@ impl EditorSnapshot {
             px(0.)
         };
 
-        GutterDimensions {
+        Some(GutterDimensions {
             left_padding,
             right_padding,
             width: line_gutter_width + left_padding + right_padding,
             margin: -descent,
             git_blame_entries_width,
-        }
+        })
     }
 
     pub fn render_crease_toggle(
@@ -16383,7 +16647,7 @@ fn inline_completion_edit_text(
     edit_preview: &EditPreview,
     include_deletions: bool,
     cx: &App,
-) -> Option<HighlightedEdits> {
+) -> HighlightedText {
     let edits = edits
         .iter()
         .map(|(anchor, text)| {
@@ -16394,7 +16658,7 @@ fn inline_completion_edit_text(
         })
         .collect::<Vec<_>>();
 
-    Some(edit_preview.highlight_edits(current_snapshot, &edits, include_deletions, cx))
+    edit_preview.highlight_edits(current_snapshot, &edits, include_deletions, cx)
 }
 
 pub fn highlight_diagnostic_message(

@@ -309,33 +309,38 @@ message Envelope {
 
         RegisterBufferWithLanguageServers register_buffer_with_language_servers = 290;
 
-        SynchronizeBreakpoints Synchronize_breakpoints = 293;
-        SetActiveDebugLine set_active_debug_line = 294;
-        RemoveActiveDebugLine remove_active_debug_line = 295;
-        SetDebuggerPanelItem set_debugger_panel_item = 296;
-        UpdateDebugAdapter update_debug_adapter = 297;
-        ShutdownDebugClient shutdown_debug_client = 298;
-        SetDebugClientCapabilities set_debug_client_capabilities = 299;
+        Stage stage = 293;
+        Unstage unstage = 294;
+        Commit commit = 295;
+        OpenCommitMessageBuffer open_commit_message_buffer = 296;
 
-        DapNextRequest dap_next_request = 300;
-        DapStepInRequest dap_step_in_request = 301;
-        DapStepOutRequest dap_step_out_request = 302;
-        DapStepBackRequest dap_step_back_request = 303;
-        DapContinueRequest dap_continue_request = 304;
-        DapContinueResponse dap_continue_response = 305;
-        DapPauseRequest dap_pause_request = 306;
-        DapDisconnectRequest dap_disconnect_request = 307;
-        DapTerminateThreadsRequest dap_terminate_threads_request = 308;
-        DapTerminateRequest dap_terminate_request = 309;
-        DapRestartRequest dap_restart_request = 310;
-        DapShutdownSession dap_shutdown_session = 311;
-        UpdateThreadStatus update_thread_status = 312;
-        VariablesRequest variables_request = 313;
-        DapVariables dap_variables = 314;
-        DapRestartStackFrameRequest dap_restart_stack_frame_request = 315;
-        IgnoreBreakpointState ignore_breakpoint_state = 316;
-        ToggleIgnoreBreakpoints toggle_ignore_breakpoints = 317;
-        DebuggerSessionEnded debugger_session_ended = 318; // current max
+        SynchronizeBreakpoints synchronize_breakpoints = 297;
+        SetActiveDebugLine set_active_debug_line = 298;
+        RemoveActiveDebugLine remove_active_debug_line = 299;
+        SetDebuggerPanelItem set_debugger_panel_item = 300;
+        UpdateDebugAdapter update_debug_adapter = 301;
+        ShutdownDebugClient shutdown_debug_client = 302;
+        SetDebugClientCapabilities set_debug_client_capabilities = 303;
+
+        DapNextRequest dap_next_request = 304;
+        DapStepInRequest dap_step_in_request = 305;
+        DapStepOutRequest dap_step_out_request = 306;
+        DapStepBackRequest dap_step_back_request = 307;
+        DapContinueRequest dap_continue_request = 308;
+        DapContinueResponse dap_continue_response = 309;
+        DapPauseRequest dap_pause_request = 310;
+        DapDisconnectRequest dap_disconnect_request = 311;
+        DapTerminateThreadsRequest dap_terminate_threads_request = 312;
+        DapTerminateRequest dap_terminate_request = 313;
+        DapRestartRequest dap_restart_request = 314;
+        DapShutdownSession dap_shutdown_session = 315;
+        UpdateThreadStatus update_thread_status = 316;
+        VariablesRequest variables_request = 317;
+        DapVariables dap_variables = 318;
+        DapRestartStackFrameRequest dap_restart_stack_frame_request = 319;
+        IgnoreBreakpointState ignore_breakpoint_state = 320;
+        ToggleIgnoreBreakpoints toggle_ignore_breakpoints = 321;
+        DebuggerSessionEnded debugger_session_ended = 322; // current max
     }
 
     reserved 87 to 88;
@@ -2805,8 +2810,7 @@ message DebuggerLoadedSourceList {
 }
 
 message DebuggerConsole {
-    // Editor console = 1;
-    // Editor query_bar = 2;
+    // repeated DapOutputEvent events = 1;
 }
 
 message DebuggerModuleList {
@@ -2840,6 +2844,7 @@ message UpdateDebugAdapter {
         DebuggerVariableList variable_list = 7;
         AddToVariableList add_to_variable_list = 8;
         DebuggerModuleList modules = 9;
+        DapOutputEvent output_event = 10;
     }
 }
 
@@ -2886,6 +2891,30 @@ message DapSource {
     repeated DapSource sources = 6;
     optional bytes adapter_data = 7;
     repeated DapChecksum checksums = 8;
+}
+
+enum DapOutputCategory {
+    ConsoleOutput = 0;
+    Important = 1;
+    Stdout = 2;
+    Stderr = 3;
+    Unknown = 4;
+}
+
+enum DapOutputEventGroup {
+    Start = 0;
+    StartCollapsed = 1;
+    End = 2;
+}
+
+message DapOutputEvent {
+    string output = 1;
+    optional DapOutputCategory category = 2;
+    optional uint64 variables_reference = 3;
+    optional DapOutputEventGroup group = 4;
+    optional DapSource source = 5;
+    optional uint32 line = 6;
+    optional uint32 column = 7;
 }
 
 enum DapChecksumAlgorithm {
@@ -3130,4 +3159,32 @@ message InstallExtension {
 message RegisterBufferWithLanguageServers{
     uint64 project_id = 1;
     uint64 buffer_id = 2;
+}
+
+message Stage {
+    uint64 project_id = 1;
+    uint64 worktree_id = 2;
+    uint64 work_directory_id = 3;
+    repeated string paths = 4;
+}
+
+message Unstage {
+    uint64 project_id = 1;
+    uint64 worktree_id = 2;
+    uint64 work_directory_id = 3;
+    repeated string paths = 4;
+}
+
+message Commit {
+    uint64 project_id = 1;
+    uint64 worktree_id = 2;
+    uint64 work_directory_id = 3;
+    optional string name = 4;
+    optional string email = 5;
+}
+
+message OpenCommitMessageBuffer {
+    uint64 project_id = 1;
+    uint64 worktree_id = 2;
+    uint64 work_directory_id = 3;
 }
