@@ -1,5 +1,8 @@
-use gpui::{hsla, point, px, BoxShadow};
+use std::fmt::{self, Display, Formatter};
+
+use gpui::{hsla, point, px, App, BoxShadow, Hsla};
 use smallvec::{smallvec, SmallVec};
+use theme::ActiveTheme;
 
 /// Today, elevation is primarily used to add shadows to elements, and set the correct background for elements like buttons.
 ///
@@ -15,14 +18,24 @@ pub enum ElevationIndex {
     Background,
     /// The primary surface – Contains panels, panes, containers, etc.
     Surface,
+    /// The same elevation as the primary surface, but used for the editable areas, like buffers
+    EditorSurface,
     /// A surface that is elevated above the primary surface. but below washes, models, and dragged elements.
     ElevatedSurface,
-    /// A surface that is above all non-modal surfaces, and separates the app from focused intents, like dialogs, alerts, modals, etc.
-    Wash,
-    /// A surface above the [ElevationIndex::Wash] that is used for dialogs, alerts, modals, etc.
+    /// A surface above the [ElevationIndex::ElevatedSurface] that is used for dialogs, alerts, modals, etc.
     ModalSurface,
-    /// A surface above all other surfaces, reserved exclusively for dragged elements, like a dragged file, tab or other draggable element.
-    DraggedElement,
+}
+
+impl Display for ElevationIndex {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            ElevationIndex::Background => write!(f, "Background"),
+            ElevationIndex::Surface => write!(f, "Surface"),
+            ElevationIndex::EditorSurface => write!(f, "Editor Surface"),
+            ElevationIndex::ElevatedSurface => write!(f, "Elevated Surface"),
+            ElevationIndex::ModalSurface => write!(f, "Modal Surface"),
+        }
+    }
 }
 
 impl ElevationIndex {
@@ -30,6 +43,7 @@ impl ElevationIndex {
     pub fn shadow(self) -> SmallVec<[BoxShadow; 2]> {
         match self {
             ElevationIndex::Surface => smallvec![],
+            ElevationIndex::EditorSurface => smallvec![],
 
             ElevationIndex::ElevatedSurface => smallvec![BoxShadow {
                 color: hsla(0., 0., 0., 0.12),
@@ -60,6 +74,41 @@ impl ElevationIndex {
             ],
 
             _ => smallvec![],
+        }
+    }
+
+    /// Returns the background color for the given elevation index.
+    pub fn bg(&self, cx: &mut App) -> Hsla {
+        match self {
+            ElevationIndex::Background => cx.theme().colors().background,
+            ElevationIndex::Surface => cx.theme().colors().surface_background,
+            ElevationIndex::EditorSurface => cx.theme().colors().editor_background,
+            ElevationIndex::ElevatedSurface => cx.theme().colors().elevated_surface_background,
+            ElevationIndex::ModalSurface => cx.theme().colors().elevated_surface_background,
+        }
+    }
+
+    /// Returns a color that is appropriate a filled element on this elevation
+    pub fn on_elevation_bg(&self, cx: &App) -> Hsla {
+        match self {
+            ElevationIndex::Background => cx.theme().colors().surface_background,
+            ElevationIndex::Surface => cx.theme().colors().background,
+            ElevationIndex::EditorSurface => cx.theme().colors().surface_background,
+            ElevationIndex::ElevatedSurface => cx.theme().colors().background,
+            ElevationIndex::ModalSurface => cx.theme().colors().background,
+        }
+    }
+
+    /// Attempts to return a darker background color than the current elevation index's background.
+    ///
+    /// If the current background color is already dark, it will return a lighter color instead.
+    pub fn darker_bg(&self, cx: &App) -> Hsla {
+        match self {
+            ElevationIndex::Background => cx.theme().colors().surface_background,
+            ElevationIndex::Surface => cx.theme().colors().editor_background,
+            ElevationIndex::EditorSurface => cx.theme().colors().surface_background,
+            ElevationIndex::ElevatedSurface => cx.theme().colors().editor_background,
+            ElevationIndex::ModalSurface => cx.theme().colors().editor_background,
         }
     }
 }

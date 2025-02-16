@@ -1,18 +1,22 @@
 use crate::headless_project::HeadlessAppState;
 use crate::HeadlessProject;
-use anyhow::{anyhow, Context, Result};
-use client::ProxySettings;
+use anyhow::{anyhow, Context as _, Result};
+use chrono::Utc;
+use client::{telemetry, ProxySettings};
+use extension::ExtensionHostProxy;
 use fs::{Fs, RealFs};
 use futures::channel::mpsc;
 use futures::{select, select_biased, AsyncRead, AsyncWrite, AsyncWriteExt, FutureExt, SinkExt};
 use git::GitHostingProviderRegistry;
-use gpui::{AppContext, Context as _, ModelContext, UpdateGlobal as _};
+use gpui::{App, AppContext as _, Context, Entity, SemanticVersion, UpdateGlobal as _};
+use gpui_tokio::Tokio;
 use http_client::{read_proxy_from_env, Uri};
 use language::LanguageRegistry;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use paths::logs_dir;
 use project::project_settings::ProjectSettings;
 
+use release_channel::{AppVersion, ReleaseChannel, RELEASE_CHANNEL};
 use remote::proxy::ProxyLaunchError;
 use remote::ssh_session::ChannelClient;
 use remote::{
@@ -21,19 +25,24 @@ use remote::{
 };
 use reqwest_client::ReqwestClient;
 use rpc::proto::{self, Envelope, SSH_PROJECT_ID};
+use rpc::{AnyProtoClient, TypedEnvelope};
 use settings::{watch_config_file, Settings, SettingsStore};
 use smol::channel::{Receiver, Sender};
 use smol::io::AsyncReadExt;
 
 use smol::Async;
 use smol::{net::unix::UnixListener, stream::StreamExt as _};
+use std::ffi::OsStr;
 use std::ops::ControlFlow;
+use std::str::FromStr;
+use std::{env, thread};
 use std::{
     io::Write,
     mem,
     path::{Path, PathBuf},
     sync::Arc,
 };
+use telemetry_events::LocationData;
 use util::ResultExt;
 
 fn init_logging_proxy() {
@@ -131,14 +140,102 @@ fn init_panic_hook() {
             backtrace.drain(0..=ix);
         }
 
+        let thread = thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+
         log::error!(
             "panic occurred: {}\nBacktrace:\n{}",
-            payload,
-            backtrace.join("\n")
+            &payload,
+            (&backtrace).join("\n")
         );
+
+        let release_channel = *RELEASE_CHANNEL;
+        let version = match release_channel {
+            ReleaseChannel::Stable | ReleaseChannel::Preview => env!("ZED_PKG_VERSION"),
+            ReleaseChannel::Nightly | ReleaseChannel::Dev => {
+                option_env!("ZED_COMMIT_SHA").unwrap_or("missing-zed-commit-sha")
+            }
+        };
+
+        let panic_data = telemetry_events::Panic {
+            thread: thread_name.into(),
+            payload: payload.clone(),
+            location_data: info.location().map(|location| LocationData {
+                file: location.file().into(),
+                line: location.line(),
+            }),
+            app_version: format!("remote-server-{version}"),
+            app_commit_sha: option_env!("ZED_COMMIT_SHA").map(|sha| sha.into()),
+            release_channel: release_channel.display_name().into(),
+            target: env!("TARGET").to_owned().into(),
+            os_name: telemetry::os_name(),
+            os_version: Some(telemetry::os_version()),
+            architecture: env::consts::ARCH.into(),
+            panicked_on: Utc::now().timestamp_millis(),
+            backtrace,
+            system_id: None,            // Set on SSH client
+            installation_id: None,      // Set on SSH client
+            session_id: "".to_string(), // Set on SSH client
+        };
+
+        if let Some(panic_data_json) = serde_json::to_string(&panic_data).log_err() {
+            let timestamp = chrono::Utc::now().format("%Y_%m_%d %H_%M_%S").to_string();
+            let panic_file_path = paths::logs_dir().join(format!("zed-{timestamp}.panic"));
+            let panic_file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&panic_file_path)
+                .log_err();
+            if let Some(mut panic_file) = panic_file {
+                writeln!(&mut panic_file, "{panic_data_json}").log_err();
+                panic_file.flush().log_err();
+            }
+        }
 
         std::process::abort();
     }));
+}
+
+fn handle_panic_requests(project: &Entity<HeadlessProject>, client: &Arc<ChannelClient>) {
+    let client: AnyProtoClient = client.clone().into();
+    client.add_request_handler(
+        project.downgrade(),
+        |_, _: TypedEnvelope<proto::GetPanicFiles>, _cx| async move {
+            let mut children = smol::fs::read_dir(paths::logs_dir()).await?;
+            let mut panic_files = Vec::new();
+            while let Some(child) = children.next().await {
+                let child = child?;
+                let child_path = child.path();
+
+                if child_path.extension() != Some(OsStr::new("panic")) {
+                    continue;
+                }
+                let filename = if let Some(filename) = child_path.file_name() {
+                    filename.to_string_lossy()
+                } else {
+                    continue;
+                };
+
+                if !filename.starts_with("zed") {
+                    continue;
+                }
+
+                let file_contents = smol::fs::read_to_string(&child_path)
+                    .await
+                    .context("error reading panic file")?;
+
+                panic_files.push(file_contents);
+
+                // We've done what we can, delete the file
+                std::fs::remove_file(child_path)
+                    .context("error removing panic")
+                    .log_err();
+            }
+            anyhow::Ok(proto::GetPanicFilesResponse {
+                file_contents: panic_files,
+            })
+        },
+    );
 }
 
 struct ServerListeners {
@@ -159,8 +256,8 @@ impl ServerListeners {
 
 fn start_server(
     listeners: ServerListeners,
-    mut log_rx: Receiver<Vec<u8>>,
-    cx: &mut AppContext,
+    log_rx: Receiver<Vec<u8>>,
+    cx: &mut App,
 ) -> Arc<ChannelClient> {
     // This is the server idle timeout. If no connection comes in in this timeout, the server will shut down.
     const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
@@ -261,8 +358,8 @@ fn start_server(
                         }
                     }
 
-                    log_message = log_rx.next().fuse() => {
-                        if let Some(log_message) = log_message {
+                    log_message = log_rx.recv().fuse() => {
+                        if let Ok(log_message) = log_message {
                             if let Err(error) = stderr_stream.write_all(&log_message).await {
                                 log::error!("failed to write log message to stderr: {:?}", error);
                                 break;
@@ -290,6 +387,8 @@ fn init_paths() -> anyhow::Result<()> {
         paths::languages_dir(),
         paths::logs_dir(),
         paths::temp_dir(),
+        paths::remote_extensions_dir(),
+        paths::remote_extensions_uploads_dir(),
     ]
     .iter()
     {
@@ -329,8 +428,12 @@ pub fn execute_run(
     let listeners = ServerListeners::new(stdin_socket, stdout_socket, stderr_socket)?;
 
     let git_hosting_provider_registry = Arc::new(GitHostingProviderRegistry::new());
-    gpui::App::headless().run(move |cx| {
+    gpui::Application::headless().run(move |cx| {
         settings::init(cx);
+        let app_version = AppVersion::init(env!("ZED_PKG_VERSION"));
+        release_channel::init(app_version, cx);
+        gpui_tokio::init(cx);
+
         HeadlessProject::init(cx);
 
         log::info!("gpui app started, initializing server");
@@ -341,24 +444,30 @@ pub fn execute_run(
         GitHostingProviderRegistry::set_global(git_hosting_provider_registry, cx);
         git_hosting_providers::init(cx);
 
-        let project = cx.new_model(|cx| {
+        extension::init(cx);
+        let extension_host_proxy = ExtensionHostProxy::global(cx);
+
+        let project = cx.new(|cx| {
             let fs = Arc::new(RealFs::new(Default::default(), None));
             let node_settings_rx = initialize_settings(session.clone(), fs.clone(), cx);
 
             let proxy_url = read_proxy_settings(cx);
 
-            let http_client = Arc::new(
-                ReqwestClient::proxy_and_user_agent(
-                    proxy_url,
-                    &format!(
-                        "Zed-Server/{} ({}; {})",
-                        env!("CARGO_PKG_VERSION"),
-                        std::env::consts::OS,
-                        std::env::consts::ARCH
-                    ),
+            let http_client = {
+                let _guard = Tokio::handle(cx).enter();
+                Arc::new(
+                    ReqwestClient::proxy_and_user_agent(
+                        proxy_url,
+                        &format!(
+                            "Zed-Server/{} ({}; {})",
+                            env!("CARGO_PKG_VERSION"),
+                            std::env::consts::OS,
+                            std::env::consts::ARCH
+                        ),
+                    )
+                    .expect("Could not start HTTP client"),
                 )
-                .expect("Could not start HTTP client"),
-            );
+            };
 
             let node_runtime = NodeRuntime::new(http_client.clone(), node_settings_rx);
 
@@ -368,15 +477,22 @@ pub fn execute_run(
 
             HeadlessProject::new(
                 HeadlessAppState {
-                    session,
+                    session: session.clone(),
                     fs,
                     http_client,
                     node_runtime,
                     languages,
+                    extension_host_proxy,
                 },
                 cx,
             )
         });
+
+        handle_panic_requests(&project, &session);
+
+        cx.background_executor()
+            .spawn(async move { cleanup_old_binaries() })
+            .detach();
 
         mem::forget(project);
     });
@@ -635,7 +751,7 @@ async fn write_size_prefixed_buffer<S: AsyncWrite + Unpin>(
 fn initialize_settings(
     session: Arc<ChannelClient>,
     fs: Arc<dyn Fs>,
-    cx: &mut AppContext,
+    cx: &mut App,
 ) -> async_watch::Receiver<Option<NodeBinaryOptions>> {
     let user_settings_file_rx = watch_config_file(
         &cx.background_executor(),
@@ -703,8 +819,8 @@ fn initialize_settings(
 
 pub fn handle_settings_file_changes(
     mut server_settings_file: mpsc::UnboundedReceiver<String>,
-    cx: &mut AppContext,
-    settings_changed: impl Fn(Option<anyhow::Error>, &mut AppContext) + 'static,
+    cx: &mut App,
+    settings_changed: impl Fn(Option<anyhow::Error>, &mut App) + 'static,
 ) {
     let server_settings_content = cx
         .background_executor()
@@ -723,7 +839,7 @@ pub fn handle_settings_file_changes(
                     log::error!("Failed to load server settings: {err}");
                 }
                 settings_changed(result.err(), cx);
-                cx.refresh();
+                cx.refresh_windows();
             });
             if result.is_err() {
                 break; // App dropped
@@ -733,7 +849,7 @@ pub fn handle_settings_file_changes(
     .detach();
 }
 
-fn read_proxy_settings(cx: &mut ModelContext<'_, HeadlessProject>) -> Option<Uri> {
+fn read_proxy_settings(cx: &mut Context<'_, HeadlessProject>) -> Option<Uri> {
     let proxy_str = ProxySettings::get_global(cx).proxy.to_owned();
     let proxy_url = proxy_str
         .as_ref()
@@ -785,4 +901,50 @@ unsafe fn redirect_standard_streams() -> Result<()> {
     );
 
     Ok(())
+}
+
+fn cleanup_old_binaries() -> Result<()> {
+    let server_dir = paths::remote_server_dir_relative();
+    let release_channel = release_channel::RELEASE_CHANNEL.dev_name();
+    let prefix = format!("zed-remote-server-{}-", release_channel);
+
+    for entry in std::fs::read_dir(server_dir)? {
+        let path = entry?.path();
+
+        if let Some(file_name) = path.file_name() {
+            if let Some(version) = file_name.to_string_lossy().strip_prefix(&prefix) {
+                if !is_new_version(version) && !is_file_in_use(file_name) {
+                    log::info!("removing old remote server binary: {:?}", path);
+                    std::fs::remove_file(&path)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_new_version(version: &str) -> bool {
+    SemanticVersion::from_str(version)
+        .ok()
+        .zip(SemanticVersion::from_str(env!("ZED_PKG_VERSION")).ok())
+        .is_some_and(|(version, current_version)| version >= current_version)
+}
+
+fn is_file_in_use(file_name: &OsStr) -> bool {
+    let info =
+        sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_processes(
+            sysinfo::ProcessRefreshKind::new().with_exe(sysinfo::UpdateKind::Always),
+        ));
+
+    for process in info.processes().values() {
+        if process
+            .exe()
+            .is_some_and(|exe| exe.file_name().is_some_and(|name| name == file_name))
+        {
+            return true;
+        }
+    }
+
+    false
 }

@@ -6,31 +6,33 @@ use crate::{
     },
 };
 use anyhow::{anyhow, Result};
-use assistant::{ContextStore, PromptBuilder};
+use assistant_context_editor::ContextStore;
+use assistant_slash_command::SlashCommandWorkingSet;
 use call::{room, ActiveCall, ParticipantLocation, Room};
 use client::{User, RECEIVE_TIMEOUT};
 use collections::{HashMap, HashSet};
 use fs::{FakeFs, Fs as _, RemoveOptions};
 use futures::{channel::mpsc, StreamExt as _};
-use git::repository::GitFileStatus;
+use prompt_library::PromptBuilder;
+
+use git::status::{FileStatus, StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode};
 use gpui::{
-    px, size, AppContext, BackgroundExecutor, Model, Modifiers, MouseButton, MouseDownEvent,
+    px, size, App, BackgroundExecutor, Entity, Modifiers, MouseButton, MouseDownEvent,
     TestAppContext, UpdateGlobal,
 };
 use language::{
     language_settings::{
         AllLanguageSettings, Formatter, FormatterList, PrettierSettings, SelectedFormatter,
     },
-    tree_sitter_rust, Diagnostic, DiagnosticEntry, FakeLspAdapter, Language, LanguageConfig,
-    LanguageMatcher, LineEnding, OffsetRangeExt, Point, Rope,
+    tree_sitter_rust, tree_sitter_typescript, Diagnostic, DiagnosticEntry, FakeLspAdapter,
+    Language, LanguageConfig, LanguageMatcher, LineEnding, OffsetRangeExt, Point, Rope,
 };
-use live_kit_client::MacOSDisplay;
 use lsp::LanguageServerId;
 use parking_lot::Mutex;
-use project::lsp_store::FormatTarget;
 use project::{
-    lsp_store::FormatTrigger, search::SearchQuery, search::SearchResult, DiagnosticSummary,
-    HoverBlockKind, Project, ProjectPath,
+    lsp_store::{FormatTrigger, LspFormatTarget},
+    search::{SearchQuery, SearchResult},
+    DiagnosticSummary, HoverBlockKind, Project, ProjectPath,
 };
 use rand::prelude::*;
 use serde_json::json;
@@ -240,56 +242,60 @@ async fn test_basic_calls(
         }
     );
 
-    // User A shares their screen
-    let display = MacOSDisplay::new();
-    let events_b = active_call_events(cx_b);
-    let events_c = active_call_events(cx_c);
-    active_call_a
-        .update(cx_a, |call, cx| {
-            call.room().unwrap().update(cx, |room, cx| {
-                room.set_display_sources(vec![display.clone()]);
-                room.share_screen(cx)
+    // TODO: Re-enable this test once we can replace our swift Livekit SDK with the rust SDK
+    #[cfg(not(target_os = "macos"))]
+    {
+        // User A shares their screen
+        let display = gpui::TestScreenCaptureSource::new();
+        let events_b = active_call_events(cx_b);
+        let events_c = active_call_events(cx_c);
+        cx_a.set_screen_capture_sources(vec![display]);
+        active_call_a
+            .update(cx_a, |call, cx| {
+                call.room()
+                    .unwrap()
+                    .update(cx, |room, cx| room.share_screen(cx))
             })
-        })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
-    executor.run_until_parked();
+        executor.run_until_parked();
 
-    // User B observes the remote screen sharing track.
-    assert_eq!(events_b.borrow().len(), 1);
-    let event_b = events_b.borrow().first().unwrap().clone();
-    if let call::room::Event::RemoteVideoTracksChanged { participant_id } = event_b {
-        assert_eq!(participant_id, client_a.peer_id().unwrap());
+        // User B observes the remote screen sharing track.
+        assert_eq!(events_b.borrow().len(), 1);
+        let event_b = events_b.borrow().first().unwrap().clone();
+        if let call::room::Event::RemoteVideoTracksChanged { participant_id } = event_b {
+            assert_eq!(participant_id, client_a.peer_id().unwrap());
 
-        room_b.read_with(cx_b, |room, _| {
-            assert_eq!(
-                room.remote_participants()[&client_a.user_id().unwrap()]
-                    .video_tracks
-                    .len(),
-                1
-            );
-        });
-    } else {
-        panic!("unexpected event")
-    }
+            room_b.read_with(cx_b, |room, _| {
+                assert_eq!(
+                    room.remote_participants()[&client_a.user_id().unwrap()]
+                        .video_tracks
+                        .len(),
+                    1
+                );
+            });
+        } else {
+            panic!("unexpected event")
+        }
 
-    // User C observes the remote screen sharing track.
-    assert_eq!(events_c.borrow().len(), 1);
-    let event_c = events_c.borrow().first().unwrap().clone();
-    if let call::room::Event::RemoteVideoTracksChanged { participant_id } = event_c {
-        assert_eq!(participant_id, client_a.peer_id().unwrap());
+        // User C observes the remote screen sharing track.
+        assert_eq!(events_c.borrow().len(), 1);
+        let event_c = events_c.borrow().first().unwrap().clone();
+        if let call::room::Event::RemoteVideoTracksChanged { participant_id } = event_c {
+            assert_eq!(participant_id, client_a.peer_id().unwrap());
 
-        room_c.read_with(cx_c, |room, _| {
-            assert_eq!(
-                room.remote_participants()[&client_a.user_id().unwrap()]
-                    .video_tracks
-                    .len(),
-                1
-            );
-        });
-    } else {
-        panic!("unexpected event")
+            room_c.read_with(cx_c, |room, _| {
+                assert_eq!(
+                    room.remote_participants()[&client_a.user_id().unwrap()]
+                        .video_tracks
+                        .len(),
+                    1
+                );
+            });
+        } else {
+            panic!("unexpected event")
+        }
     }
 
     // User A leaves the room.
@@ -328,7 +334,7 @@ async fn test_basic_calls(
     // to automatically leave the room. User C leaves the room as well because
     // nobody else is in there.
     server
-        .test_live_kit_server
+        .test_livekit_server
         .disconnect_client(client_b.user_id().unwrap().to_string())
         .await;
     executor.run_until_parked();
@@ -843,7 +849,7 @@ async fn test_client_disconnecting_from_room(
     // User B gets disconnected from the LiveKit server, which causes it
     // to automatically leave the room.
     server
-        .test_live_kit_server
+        .test_livekit_server
         .disconnect_client(client_b.user_id().unwrap().to_string())
         .await;
     executor.run_until_parked();
@@ -1833,6 +1839,8 @@ async fn test_active_call_events(
                 id: client_a.user_id().unwrap(),
                 github_login: "user_a".to_string(),
                 avatar_uri: "avatar_a".into(),
+                name: None,
+                email: None,
             }),
             project_id: project_a_id,
             worktree_root_names: vec!["a".to_string()],
@@ -1851,6 +1859,8 @@ async fn test_active_call_events(
                 id: client_b.user_id().unwrap(),
                 github_login: "user_b".to_string(),
                 avatar_uri: "avatar_b".into(),
+                name: None,
+                email: None,
             }),
             project_id: project_b_id,
             worktree_root_names: vec!["b".to_string()]
@@ -1942,7 +1952,7 @@ async fn test_mute_deafen(
     room_a.read_with(cx_a, |room, _| assert!(!room.is_muted()));
     room_b.read_with(cx_b, |room, _| assert!(!room.is_muted()));
 
-    // Users A and B are both muted.
+    // Users A and B are both unmuted.
     assert_eq!(
         participant_audio_state(&room_a, cx_a),
         &[ParticipantAudioState {
@@ -2062,7 +2072,7 @@ async fn test_mute_deafen(
     }
 
     fn participant_audio_state(
-        room: &Model<Room>,
+        room: &Entity<Room>,
         cx: &TestAppContext,
     ) -> Vec<ParticipantAudioState> {
         room.read_with(cx, |room, _| {
@@ -2074,7 +2084,17 @@ async fn test_mute_deafen(
                     audio_tracks_playing: participant
                         .audio_tracks
                         .values()
-                        .map(|track| track.is_playing())
+                        .map({
+                            #[cfg(target_os = "macos")]
+                            {
+                                |track| track.is_playing()
+                            }
+
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                |(track, _)| track.rtc_track().enabled()
+                            }
+                        })
                         .collect(),
                 })
                 .collect::<Vec<_>>()
@@ -2231,7 +2251,7 @@ async fn test_room_location(
     );
 
     fn participant_locations(
-        room: &Model<Room>,
+        room: &Entity<Room>,
         cx: &TestAppContext,
     ) -> Vec<(String, ParticipantLocation)> {
         room.read_with(cx, |room, _| {
@@ -2538,13 +2558,27 @@ async fn test_git_diff_base_change(
 
     let project_remote = client_b.join_remote_project(project_id, cx_b).await;
 
-    let diff_base = "
+    let staged_text = "
         one
         three
     "
     .unindent();
 
-    let new_diff_base = "
+    let committed_text = "
+        one
+        TWO
+        three
+    "
+    .unindent();
+
+    let new_committed_text = "
+        one
+        TWO_HUNDRED
+        three
+    "
+    .unindent();
+
+    let new_staged_text = "
         one
         two
     "
@@ -2552,7 +2586,11 @@ async fn test_git_diff_base_change(
 
     client_a.fs().set_index_for_repo(
         Path::new("/dir/.git"),
-        &[(Path::new("a.txt"), diff_base.clone())],
+        &[("a.txt".into(), staged_text.clone())],
+    );
+    client_a.fs().set_head_for_repo(
+        Path::new("/dir/.git"),
+        &[("a.txt".into(), committed_text.clone())],
     );
 
     // Create the buffer
@@ -2560,21 +2598,25 @@ async fn test_git_diff_base_change(
         .update(cx_a, |p, cx| p.open_buffer((worktree_id, "a.txt"), cx))
         .await
         .unwrap();
+    let local_unstaged_diff_a = project_local
+        .update(cx_a, |p, cx| {
+            p.open_unstaged_diff(buffer_local_a.clone(), cx)
+        })
+        .await
+        .unwrap();
 
     // Wait for it to catch up to the new diff
     executor.run_until_parked();
-
-    // Smoke test diffing
-
-    buffer_local_a.read_with(cx_a, |buffer, _| {
+    local_unstaged_diff_a.read_with(cx_a, |diff, cx| {
+        let buffer = buffer_local_a.read(cx);
         assert_eq!(
-            buffer.diff_base().map(|rope| rope.to_string()).as_deref(),
-            Some(diff_base.as_str())
+            diff.base_text_string().as_deref(),
+            Some(staged_text.as_str())
         );
-        git::diff::assert_hunks(
-            buffer.snapshot().git_diff_hunks_in_row_range(0..4),
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
             buffer,
-            &diff_base,
+            &diff.base_text_string().unwrap(),
             &[(1..2, "", "two\n")],
         );
     });
@@ -2584,73 +2626,113 @@ async fn test_git_diff_base_change(
         .update(cx_b, |p, cx| p.open_buffer((worktree_id, "a.txt"), cx))
         .await
         .unwrap();
+    let remote_unstaged_diff_a = project_remote
+        .update(cx_b, |p, cx| {
+            p.open_unstaged_diff(buffer_remote_a.clone(), cx)
+        })
+        .await
+        .unwrap();
 
     // Wait remote buffer to catch up to the new diff
     executor.run_until_parked();
-
-    // Smoke test diffing
-
-    buffer_remote_a.read_with(cx_b, |buffer, _| {
+    remote_unstaged_diff_a.read_with(cx_b, |diff, cx| {
+        let buffer = buffer_remote_a.read(cx);
         assert_eq!(
-            buffer.diff_base().map(|rope| rope.to_string()).as_deref(),
-            Some(diff_base.as_str())
+            diff.base_text_string().as_deref(),
+            Some(staged_text.as_str())
         );
-        git::diff::assert_hunks(
-            buffer.snapshot().git_diff_hunks_in_row_range(0..4),
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
             buffer,
-            &diff_base,
+            &diff.base_text_string().unwrap(),
             &[(1..2, "", "two\n")],
         );
     });
 
+    // Open uncommitted changes on the guest, without opening them on the host first
+    let remote_uncommitted_diff_a = project_remote
+        .update(cx_b, |p, cx| {
+            p.open_uncommitted_diff(buffer_remote_a.clone(), cx)
+        })
+        .await
+        .unwrap();
+    executor.run_until_parked();
+    remote_uncommitted_diff_a.read_with(cx_b, |diff, cx| {
+        let buffer = buffer_remote_a.read(cx);
+        assert_eq!(
+            diff.base_text_string().as_deref(),
+            Some(committed_text.as_str())
+        );
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
+            buffer,
+            &diff.base_text_string().unwrap(),
+            &[(1..2, "TWO\n", "two\n")],
+        );
+    });
+
+    // Update the index text of the open buffer
     client_a.fs().set_index_for_repo(
         Path::new("/dir/.git"),
-        &[(Path::new("a.txt"), new_diff_base.clone())],
+        &[("a.txt".into(), new_staged_text.clone())],
+    );
+    client_a.fs().set_head_for_repo(
+        Path::new("/dir/.git"),
+        &[("a.txt".into(), new_committed_text.clone())],
     );
 
     // Wait for buffer_local_a to receive it
     executor.run_until_parked();
-
-    // Smoke test new diffing
-
-    buffer_local_a.read_with(cx_a, |buffer, _| {
+    local_unstaged_diff_a.read_with(cx_a, |diff, cx| {
+        let buffer = buffer_local_a.read(cx);
         assert_eq!(
-            buffer.diff_base().map(|rope| rope.to_string()).as_deref(),
-            Some(new_diff_base.as_str())
+            diff.base_text_string().as_deref(),
+            Some(new_staged_text.as_str())
         );
-
-        git::diff::assert_hunks(
-            buffer.snapshot().git_diff_hunks_in_row_range(0..4),
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
             buffer,
-            &diff_base,
+            &diff.base_text_string().unwrap(),
             &[(2..3, "", "three\n")],
         );
     });
 
-    // Smoke test B
-
-    buffer_remote_a.read_with(cx_b, |buffer, _| {
+    remote_unstaged_diff_a.read_with(cx_b, |diff, cx| {
+        let buffer = buffer_remote_a.read(cx);
         assert_eq!(
-            buffer.diff_base().map(|rope| rope.to_string()).as_deref(),
-            Some(new_diff_base.as_str())
+            diff.base_text_string().as_deref(),
+            Some(new_staged_text.as_str())
         );
-        git::diff::assert_hunks(
-            buffer.snapshot().git_diff_hunks_in_row_range(0..4),
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
             buffer,
-            &diff_base,
+            &diff.base_text_string().unwrap(),
             &[(2..3, "", "three\n")],
         );
     });
 
-    //Nested git dir
+    remote_uncommitted_diff_a.read_with(cx_b, |diff, cx| {
+        let buffer = buffer_remote_a.read(cx);
+        assert_eq!(
+            diff.base_text_string().as_deref(),
+            Some(new_committed_text.as_str())
+        );
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
+            buffer,
+            &diff.base_text_string().unwrap(),
+            &[(1..2, "TWO_HUNDRED\n", "two\n")],
+        );
+    });
 
-    let diff_base = "
+    // Nested git dir
+    let staged_text = "
         one
         three
     "
     .unindent();
 
-    let new_diff_base = "
+    let new_staged_text = "
         one
         two
     "
@@ -2658,7 +2740,7 @@ async fn test_git_diff_base_change(
 
     client_a.fs().set_index_for_repo(
         Path::new("/dir/sub/.git"),
-        &[(Path::new("b.txt"), diff_base.clone())],
+        &[("b.txt".into(), staged_text.clone())],
     );
 
     // Create the buffer
@@ -2666,21 +2748,25 @@ async fn test_git_diff_base_change(
         .update(cx_a, |p, cx| p.open_buffer((worktree_id, "sub/b.txt"), cx))
         .await
         .unwrap();
+    let local_unstaged_diff_b = project_local
+        .update(cx_a, |p, cx| {
+            p.open_unstaged_diff(buffer_local_b.clone(), cx)
+        })
+        .await
+        .unwrap();
 
     // Wait for it to catch up to the new diff
     executor.run_until_parked();
-
-    // Smoke test diffing
-
-    buffer_local_b.read_with(cx_a, |buffer, _| {
+    local_unstaged_diff_b.read_with(cx_a, |diff, cx| {
+        let buffer = buffer_local_b.read(cx);
         assert_eq!(
-            buffer.diff_base().map(|rope| rope.to_string()).as_deref(),
-            Some(diff_base.as_str())
+            diff.base_text_string().as_deref(),
+            Some(staged_text.as_str())
         );
-        git::diff::assert_hunks(
-            buffer.snapshot().git_diff_hunks_in_row_range(0..4),
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
             buffer,
-            &diff_base,
+            &diff.base_text_string().unwrap(),
             &[(1..2, "", "two\n")],
         );
     });
@@ -2690,69 +2776,60 @@ async fn test_git_diff_base_change(
         .update(cx_b, |p, cx| p.open_buffer((worktree_id, "sub/b.txt"), cx))
         .await
         .unwrap();
+    let remote_unstaged_diff_b = project_remote
+        .update(cx_b, |p, cx| {
+            p.open_unstaged_diff(buffer_remote_b.clone(), cx)
+        })
+        .await
+        .unwrap();
 
-    // Wait remote buffer to catch up to the new diff
     executor.run_until_parked();
-
-    // Smoke test diffing
-
-    buffer_remote_b.read_with(cx_b, |buffer, _| {
+    remote_unstaged_diff_b.read_with(cx_b, |diff, cx| {
+        let buffer = buffer_remote_b.read(cx);
         assert_eq!(
-            buffer.diff_base().map(|rope| rope.to_string()).as_deref(),
-            Some(diff_base.as_str())
+            diff.base_text_string().as_deref(),
+            Some(staged_text.as_str())
         );
-        git::diff::assert_hunks(
-            buffer.snapshot().git_diff_hunks_in_row_range(0..4),
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
             buffer,
-            &diff_base,
+            &staged_text,
             &[(1..2, "", "two\n")],
         );
     });
 
+    // Updatet the staged text
     client_a.fs().set_index_for_repo(
         Path::new("/dir/sub/.git"),
-        &[(Path::new("b.txt"), new_diff_base.clone())],
+        &[("b.txt".into(), new_staged_text.clone())],
     );
 
     // Wait for buffer_local_b to receive it
     executor.run_until_parked();
-
-    // Smoke test new diffing
-
-    buffer_local_b.read_with(cx_a, |buffer, _| {
+    local_unstaged_diff_b.read_with(cx_a, |diff, cx| {
+        let buffer = buffer_local_b.read(cx);
         assert_eq!(
-            buffer.diff_base().map(|rope| rope.to_string()).as_deref(),
-            Some(new_diff_base.as_str())
+            diff.base_text_string().as_deref(),
+            Some(new_staged_text.as_str())
         );
-        println!("{:?}", buffer.as_rope().to_string());
-        println!("{:?}", buffer.diff_base());
-        println!(
-            "{:?}",
-            buffer
-                .snapshot()
-                .git_diff_hunks_in_row_range(0..4)
-                .collect::<Vec<_>>()
-        );
-
-        git::diff::assert_hunks(
-            buffer.snapshot().git_diff_hunks_in_row_range(0..4),
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
             buffer,
-            &diff_base,
+            &new_staged_text,
             &[(2..3, "", "three\n")],
         );
     });
 
-    // Smoke test B
-
-    buffer_remote_b.read_with(cx_b, |buffer, _| {
+    remote_unstaged_diff_b.read_with(cx_b, |diff, cx| {
+        let buffer = buffer_remote_b.read(cx);
         assert_eq!(
-            buffer.diff_base().map(|rope| rope.to_string()).as_deref(),
-            Some(new_diff_base.as_str())
+            diff.base_text_string().as_deref(),
+            Some(new_staged_text.as_str())
         );
-        git::diff::assert_hunks(
-            buffer.snapshot().git_diff_hunks_in_row_range(0..4),
+        diff::assert_hunks(
+            diff.snapshot.hunks_in_row_range(0..4, buffer),
             buffer,
-            &diff_base,
+            &new_staged_text,
             &[(2..3, "", "three\n")],
         );
     });
@@ -2801,7 +2878,7 @@ async fn test_git_branch_name(
     executor.run_until_parked();
 
     #[track_caller]
-    fn assert_branch(branch_name: Option<impl Into<String>>, project: &Project, cx: &AppContext) {
+    fn assert_branch(branch_name: Option<impl Into<String>>, project: &Project, cx: &App) {
         let branch_name = branch_name.map(Into::into);
         let worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
         assert_eq!(worktrees.len(), 1);
@@ -2876,11 +2953,20 @@ async fn test_git_status_sync(
     const A_TXT: &str = "a.txt";
     const B_TXT: &str = "b.txt";
 
+    const A_STATUS_START: FileStatus = FileStatus::Tracked(TrackedStatus {
+        index_status: StatusCode::Added,
+        worktree_status: StatusCode::Modified,
+    });
+    const B_STATUS_START: FileStatus = FileStatus::Unmerged(UnmergedStatus {
+        first_head: UnmergedStatusCode::Updated,
+        second_head: UnmergedStatusCode::Deleted,
+    });
+
     client_a.fs().set_status_for_repo_via_git_operation(
         Path::new("/dir/.git"),
         &[
-            (Path::new(A_TXT), GitFileStatus::Added),
-            (Path::new(B_TXT), GitFileStatus::Added),
+            (Path::new(A_TXT), A_STATUS_START),
+            (Path::new(B_TXT), B_STATUS_START),
         ],
     );
 
@@ -2900,9 +2986,9 @@ async fn test_git_status_sync(
     #[track_caller]
     fn assert_status(
         file: &impl AsRef<Path>,
-        status: Option<GitFileStatus>,
+        status: Option<FileStatus>,
         project: &Project,
-        cx: &AppContext,
+        cx: &App,
     ) {
         let file = file.as_ref();
         let worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
@@ -2912,23 +2998,30 @@ async fn test_git_status_sync(
         assert_eq!(snapshot.status_for_file(file), status);
     }
 
-    // Smoke test status reading
-
     project_local.read_with(cx_a, |project, cx| {
-        assert_status(&Path::new(A_TXT), Some(GitFileStatus::Added), project, cx);
-        assert_status(&Path::new(B_TXT), Some(GitFileStatus::Added), project, cx);
+        assert_status(&Path::new(A_TXT), Some(A_STATUS_START), project, cx);
+        assert_status(&Path::new(B_TXT), Some(B_STATUS_START), project, cx);
     });
 
     project_remote.read_with(cx_b, |project, cx| {
-        assert_status(&Path::new(A_TXT), Some(GitFileStatus::Added), project, cx);
-        assert_status(&Path::new(B_TXT), Some(GitFileStatus::Added), project, cx);
+        assert_status(&Path::new(A_TXT), Some(A_STATUS_START), project, cx);
+        assert_status(&Path::new(B_TXT), Some(B_STATUS_START), project, cx);
+    });
+
+    const A_STATUS_END: FileStatus = FileStatus::Tracked(TrackedStatus {
+        index_status: StatusCode::Added,
+        worktree_status: StatusCode::Unmodified,
+    });
+    const B_STATUS_END: FileStatus = FileStatus::Tracked(TrackedStatus {
+        index_status: StatusCode::Deleted,
+        worktree_status: StatusCode::Unmodified,
     });
 
     client_a.fs().set_status_for_repo_via_working_copy_change(
         Path::new("/dir/.git"),
         &[
-            (Path::new(A_TXT), GitFileStatus::Modified),
-            (Path::new(B_TXT), GitFileStatus::Modified),
+            (Path::new(A_TXT), A_STATUS_END),
+            (Path::new(B_TXT), B_STATUS_END),
         ],
     );
 
@@ -2938,33 +3031,13 @@ async fn test_git_status_sync(
     // Smoke test status reading
 
     project_local.read_with(cx_a, |project, cx| {
-        assert_status(
-            &Path::new(A_TXT),
-            Some(GitFileStatus::Modified),
-            project,
-            cx,
-        );
-        assert_status(
-            &Path::new(B_TXT),
-            Some(GitFileStatus::Modified),
-            project,
-            cx,
-        );
+        assert_status(&Path::new(A_TXT), Some(A_STATUS_END), project, cx);
+        assert_status(&Path::new(B_TXT), Some(B_STATUS_END), project, cx);
     });
 
     project_remote.read_with(cx_b, |project, cx| {
-        assert_status(
-            &Path::new(A_TXT),
-            Some(GitFileStatus::Modified),
-            project,
-            cx,
-        );
-        assert_status(
-            &Path::new(B_TXT),
-            Some(GitFileStatus::Modified),
-            project,
-            cx,
-        );
+        assert_status(&Path::new(A_TXT), Some(A_STATUS_END), project, cx);
+        assert_status(&Path::new(B_TXT), Some(B_STATUS_END), project, cx);
     });
 
     // And synchronization while joining
@@ -2972,18 +3045,8 @@ async fn test_git_status_sync(
     executor.run_until_parked();
 
     project_remote_c.read_with(cx_c, |project, cx| {
-        assert_status(
-            &Path::new(A_TXT),
-            Some(GitFileStatus::Modified),
-            project,
-            cx,
-        );
-        assert_status(
-            &Path::new(B_TXT),
-            Some(GitFileStatus::Modified),
-            project,
-            cx,
-        );
+        assert_status(&Path::new(A_TXT), Some(A_STATUS_END), project, cx);
+        assert_status(&Path::new(B_TXT), Some(B_STATUS_END), project, cx);
     });
 }
 
@@ -3878,13 +3941,7 @@ async fn test_collaborating_with_diagnostics(
     // Cause the language server to start.
     let _buffer = project_a
         .update(cx_a, |project, cx| {
-            project.open_buffer(
-                ProjectPath {
-                    worktree_id,
-                    path: Path::new("other.rs").into(),
-                },
-                cx,
-            )
+            project.open_local_buffer_with_lsp("/a/other.rs", cx)
         })
         .await
         .unwrap();
@@ -3895,7 +3952,7 @@ async fn test_collaborating_with_diagnostics(
         .receive_notification::<lsp::notification::DidOpenTextDocument>()
         .await;
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
-        lsp::PublishDiagnosticsParams {
+        &lsp::PublishDiagnosticsParams {
             uri: lsp::Url::from_file_path("/a/a.rs").unwrap(),
             version: None,
             diagnostics: vec![lsp::Diagnostic {
@@ -3915,7 +3972,7 @@ async fn test_collaborating_with_diagnostics(
         .await
         .unwrap();
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
-        lsp::PublishDiagnosticsParams {
+        &lsp::PublishDiagnosticsParams {
             uri: lsp::Url::from_file_path("/a/a.rs").unwrap(),
             version: None,
             diagnostics: vec![lsp::Diagnostic {
@@ -3989,7 +4046,7 @@ async fn test_collaborating_with_diagnostics(
 
     // Simulate a language server reporting more errors for a file.
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
-        lsp::PublishDiagnosticsParams {
+        &lsp::PublishDiagnosticsParams {
             uri: lsp::Url::from_file_path("/a/a.rs").unwrap(),
             version: None,
             diagnostics: vec![
@@ -4083,7 +4140,7 @@ async fn test_collaborating_with_diagnostics(
 
     // Simulate a language server reporting no errors for a file.
     fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
-        lsp::PublishDiagnosticsParams {
+        &lsp::PublishDiagnosticsParams {
             uri: lsp::Url::from_file_path("/a/a.rs").unwrap(),
             version: None,
             diagnostics: vec![],
@@ -4163,7 +4220,9 @@ async fn test_collaborating_with_lsp_progress_updates_and_diagnostics_ordering(
     // Join the project as client B and open all three files.
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
     let guest_buffers = futures::future::try_join_all(file_names.iter().map(|file_name| {
-        project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, file_name), cx))
+        project_b.update(cx_b, |p, cx| {
+            p.open_buffer_with_lsp((worktree_id, file_name), cx)
+        })
     }))
     .await
     .unwrap();
@@ -4176,7 +4235,7 @@ async fn test_collaborating_with_lsp_progress_updates_and_diagnostics_ordering(
         })
         .await
         .unwrap();
-    fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
+    fake_language_server.notify::<lsp::notification::Progress>(&lsp::ProgressParams {
         token: lsp::NumberOrString::String("the-disk-based-token".to_string()),
         value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::Begin(
             lsp::WorkDoneProgressBegin {
@@ -4187,7 +4246,7 @@ async fn test_collaborating_with_lsp_progress_updates_and_diagnostics_ordering(
     });
     for file_name in file_names {
         fake_language_server.notify::<lsp::notification::PublishDiagnostics>(
-            lsp::PublishDiagnosticsParams {
+            &lsp::PublishDiagnosticsParams {
                 uri: lsp::Url::from_file_path(Path::new("/test").join(file_name)).unwrap(),
                 version: None,
                 diagnostics: vec![lsp::Diagnostic {
@@ -4200,7 +4259,7 @@ async fn test_collaborating_with_lsp_progress_updates_and_diagnostics_ordering(
             },
         );
     }
-    fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
+    fake_language_server.notify::<lsp::notification::Progress>(&lsp::ProgressParams {
         token: lsp::NumberOrString::String("the-disk-based-token".to_string()),
         value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::End(
             lsp::WorkDoneProgressEnd { message: None },
@@ -4217,7 +4276,7 @@ async fn test_collaborating_with_lsp_progress_updates_and_diagnostics_ordering(
             cx.subscribe(&project_b, move |_, _, event, cx| {
                 if let project::Event::DiskBasedDiagnosticsFinished { .. } = event {
                     disk_based_diagnostics_finished.store(true, SeqCst);
-                    for buffer in &guest_buffers {
+                    for (buffer, _) in &guest_buffers {
                         assert_eq!(
                             buffer
                                 .read(cx)
@@ -4338,7 +4397,6 @@ async fn test_formatting_buffer(
     cx_a: &mut TestAppContext,
     cx_b: &mut TestAppContext,
 ) {
-    executor.allow_parking();
     let mut server = TestServer::start(executor.clone()).await;
     let client_a = server.create_client(cx_a, "user_a").await;
     let client_b = server.create_client(cx_b, "user_b").await;
@@ -4366,10 +4424,16 @@ async fn test_formatting_buffer(
         .await
         .unwrap();
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
+    let lsp_store_b = project_b.update(cx_b, |p, _| p.lsp_store());
 
-    let open_buffer = project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "a.rs"), cx));
-    let buffer_b = cx_b.executor().spawn(open_buffer).await.unwrap();
+    let buffer_b = project_b
+        .update(cx_b, |p, cx| p.open_buffer((worktree_id, "a.rs"), cx))
+        .await
+        .unwrap();
 
+    let _handle = lsp_store_b.update(cx_b, |lsp_store, cx| {
+        lsp_store.register_buffer_with_language_servers(&buffer_b, cx)
+    });
     let fake_language_server = fake_language_servers.next().await.unwrap();
     fake_language_server.handle_request::<lsp::request::Formatting, _, _>(|_, _| async move {
         Ok(Some(vec![
@@ -4388,9 +4452,9 @@ async fn test_formatting_buffer(
         .update(cx_b, |project, cx| {
             project.format(
                 HashSet::from_iter([buffer_b.clone()]),
+                LspFormatTarget::Buffers,
                 true,
                 FormatTrigger::Save,
-                FormatTarget::Buffer,
                 cx,
             )
         })
@@ -4418,13 +4482,15 @@ async fn test_formatting_buffer(
             });
         });
     });
+
+    executor.allow_parking();
     project_b
         .update(cx_b, |project, cx| {
             project.format(
                 HashSet::from_iter([buffer_b.clone()]),
+                LspFormatTarget::Buffers,
                 true,
                 FormatTrigger::Save,
-                FormatTarget::Buffer,
                 cx,
             )
         })
@@ -4461,7 +4527,7 @@ async fn test_prettier_formatting_buffer(
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::LANGUAGE.into()),
+        Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
     )));
     let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "TypeScript",
@@ -4490,8 +4556,12 @@ async fn test_prettier_formatting_buffer(
         .await
         .unwrap();
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
-    let open_buffer = project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "a.ts"), cx));
-    let buffer_b = cx_b.executor().spawn(open_buffer).await.unwrap();
+    let (buffer_b, _) = project_b
+        .update(cx_b, |p, cx| {
+            p.open_buffer_with_lsp((worktree_id, "a.ts"), cx)
+        })
+        .await
+        .unwrap();
 
     cx_a.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
@@ -4528,9 +4598,9 @@ async fn test_prettier_formatting_buffer(
         .update(cx_b, |project, cx| {
             project.format(
                 HashSet::from_iter([buffer_b.clone()]),
+                LspFormatTarget::Buffers,
                 true,
                 FormatTrigger::Save,
-                FormatTarget::Buffer,
                 cx,
             )
         })
@@ -4548,9 +4618,9 @@ async fn test_prettier_formatting_buffer(
         .update(cx_a, |project, cx| {
             project.format(
                 HashSet::from_iter([buffer_a.clone()]),
+                LspFormatTarget::Buffers,
                 true,
                 FormatTrigger::Manual,
-                FormatTarget::Buffer,
                 cx,
             )
         })
@@ -4607,8 +4677,12 @@ async fn test_definition(
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
 
     // Open the file on client B.
-    let open_buffer = project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "a.rs"), cx));
-    let buffer_b = cx_b.executor().spawn(open_buffer).await.unwrap();
+    let (buffer_b, _handle) = project_b
+        .update(cx_b, |p, cx| {
+            p.open_buffer_with_lsp((worktree_id, "a.rs"), cx)
+        })
+        .await
+        .unwrap();
 
     // Request the definition of a symbol as the guest.
     let fake_language_server = fake_language_servers.next().await.unwrap();
@@ -4752,8 +4826,12 @@ async fn test_references(
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
 
     // Open the file on client B.
-    let open_buffer = project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "one.rs"), cx));
-    let buffer_b = cx_b.executor().spawn(open_buffer).await.unwrap();
+    let (buffer_b, _handle) = project_b
+        .update(cx_b, |p, cx| {
+            p.open_buffer_with_lsp((worktree_id, "one.rs"), cx)
+        })
+        .await
+        .unwrap();
 
     // Request references to a symbol as the guest.
     let fake_language_server = fake_language_servers.next().await.unwrap();
@@ -4910,7 +4988,7 @@ async fn test_project_search(
 
     // Perform a search as the guest.
     let mut results = HashMap::default();
-    let mut search_rx = project_b.update(cx_b, |project, cx| {
+    let search_rx = project_b.update(cx_b, |project, cx| {
         project.search(
             SearchQuery::text(
                 "world",
@@ -4925,7 +5003,7 @@ async fn test_project_search(
             cx,
         )
     });
-    while let Some(result) = search_rx.next().await {
+    while let Ok(result) = search_rx.recv().await {
         match result {
             SearchResult::Buffer { buffer, ranges } => {
                 results.entry(buffer).or_insert(ranges);
@@ -4999,8 +5077,12 @@ async fn test_document_highlights(
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
 
     // Open the file on client B.
-    let open_b = project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "main.rs"), cx));
-    let buffer_b = cx_b.executor().spawn(open_b).await.unwrap();
+    let (buffer_b, _handle) = project_b
+        .update(cx_b, |p, cx| {
+            p.open_buffer_with_lsp((worktree_id, "main.rs"), cx)
+        })
+        .await
+        .unwrap();
 
     // Request document highlights as the guest.
     let fake_language_server = fake_language_servers.next().await.unwrap();
@@ -5117,8 +5199,12 @@ async fn test_lsp_hover(
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
 
     // Open the file as the guest
-    let open_buffer = project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "main.rs"), cx));
-    let buffer_b = cx_b.executor().spawn(open_buffer).await.unwrap();
+    let (buffer_b, _handle) = project_b
+        .update(cx_b, |p, cx| {
+            p.open_buffer_with_lsp((worktree_id, "main.rs"), cx)
+        })
+        .await
+        .unwrap();
 
     let mut servers_with_hover_requests = HashMap::default();
     for i in 0..language_server_names.len() {
@@ -5130,11 +5216,10 @@ async fn test_lsp_hover(
         });
         let new_server_name = new_server.server.name();
         assert!(
-            !servers_with_hover_requests.contains_key(new_server_name),
+            !servers_with_hover_requests.contains_key(&new_server_name),
             "Unexpected: initialized server with the same name twice. Name: `{new_server_name}`"
         );
-        let new_server_name = new_server_name.to_string();
-        match new_server_name.as_str() {
+        match new_server_name.as_ref() {
             "CrabLang-ls" => {
                 servers_with_hover_requests.insert(
                     new_server_name.clone(),
@@ -5294,9 +5379,12 @@ async fn test_project_symbols(
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
 
     // Cause the language server to start.
-    let open_buffer_task =
-        project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "one.rs"), cx));
-    let _buffer = cx_b.executor().spawn(open_buffer_task).await.unwrap();
+    let _buffer = project_b
+        .update(cx_b, |p, cx| {
+            p.open_buffer_with_lsp((worktree_id, "one.rs"), cx)
+        })
+        .await
+        .unwrap();
 
     let fake_language_server = fake_language_servers.next().await.unwrap();
     fake_language_server.handle_request::<lsp::WorkspaceSymbolRequest, _, _>(|_, _| async move {
@@ -5388,8 +5476,12 @@ async fn test_open_buffer_while_getting_definition_pointing_to_it(
         .unwrap();
     let project_b = client_b.join_remote_project(project_id, cx_b).await;
 
-    let open_buffer_task = project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "a.rs"), cx));
-    let buffer_b1 = cx_b.executor().spawn(open_buffer_task).await.unwrap();
+    let (buffer_b1, _lsp) = project_b
+        .update(cx_b, |p, cx| {
+            p.open_buffer_with_lsp((worktree_id, "a.rs"), cx)
+        })
+        .await
+        .unwrap();
 
     let fake_language_server = fake_language_servers.next().await.unwrap();
     fake_language_server.handle_request::<lsp::request::GotoDefinition, _, _>(|_, _| async move {
@@ -5405,13 +5497,22 @@ async fn test_open_buffer_while_getting_definition_pointing_to_it(
     let buffer_b2;
     if rng.gen() {
         definitions = project_b.update(cx_b, |p, cx| p.definition(&buffer_b1, 23, cx));
-        buffer_b2 = project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "b.rs"), cx));
+        (buffer_b2, _) = project_b
+            .update(cx_b, |p, cx| {
+                p.open_buffer_with_lsp((worktree_id, "b.rs"), cx)
+            })
+            .await
+            .unwrap();
     } else {
-        buffer_b2 = project_b.update(cx_b, |p, cx| p.open_buffer((worktree_id, "b.rs"), cx));
+        (buffer_b2, _) = project_b
+            .update(cx_b, |p, cx| {
+                p.open_buffer_with_lsp((worktree_id, "b.rs"), cx)
+            })
+            .await
+            .unwrap();
         definitions = project_b.update(cx_b, |p, cx| p.definition(&buffer_b1, 23, cx));
     }
 
-    let buffer_b2 = buffer_b2.await.unwrap();
     let definitions = definitions.await.unwrap();
     assert_eq!(definitions.len(), 1);
     assert_eq!(definitions[0].target.buffer, buffer_b2);
@@ -6016,6 +6117,8 @@ async fn test_contact_requests(
     }
 }
 
+// TODO: Re-enable this test once we can replace our swift Livekit SDK with the rust SDK
+#[cfg(not(target_os = "macos"))]
 #[gpui::test(iterations = 10)]
 async fn test_join_call_after_screen_was_shared(
     executor: BackgroundExecutor,
@@ -6058,13 +6161,13 @@ async fn test_join_call_after_screen_was_shared(
     assert_eq!(call_b.calling_user.github_login, "user_a");
 
     // User A shares their screen
-    let display = MacOSDisplay::new();
+    let display = gpui::TestScreenCaptureSource::new();
+    cx_a.set_screen_capture_sources(vec![display]);
     active_call_a
         .update(cx_a, |call, cx| {
-            call.room().unwrap().update(cx, |room, cx| {
-                room.set_display_sources(vec![display.clone()]);
-                room.share_screen(cx)
-            })
+            call.room()
+                .unwrap()
+                .update(cx, |room, cx| room.share_screen(cx))
         })
         .await
         .unwrap();
@@ -6121,7 +6224,7 @@ async fn test_right_click_menu_behind_collab_panel(cx: &mut TestAppContext) {
     cx.simulate_resize(size(px(300.), px(300.)));
 
     cx.simulate_keystrokes("cmd-n cmd-n cmd-n");
-    cx.update(|cx| cx.refresh());
+    cx.update(|window, _cx| window.refresh());
 
     let tab_bounds = cx.debug_bounds("TAB-2").unwrap();
     let new_tab_button_bounds = cx.debug_bounds("ICON-Plus").unwrap();
@@ -6214,14 +6317,14 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
 
     let pane = workspace.update(cx, |workspace, _| workspace.active_pane().clone());
 
-    let get_path = |pane: &Pane, idx: usize, cx: &AppContext| {
+    let get_path = |pane: &Pane, idx: usize, cx: &App| {
         pane.item_for_index(idx).unwrap().project_path(cx).unwrap()
     };
 
     // Opening item 3 as a "permanent" tab
     workspace
-        .update(cx, |workspace, cx| {
-            workspace.open_path(path_3.clone(), None, false, cx)
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path(path_3.clone(), None, false, window, cx)
         })
         .await
         .unwrap();
@@ -6237,8 +6340,8 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
 
     // Open item 1 as preview
     workspace
-        .update(cx, |workspace, cx| {
-            workspace.open_path_preview(path_1.clone(), None, true, true, cx)
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path_preview(path_1.clone(), None, true, true, window, cx)
         })
         .await
         .unwrap();
@@ -6258,8 +6361,8 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
 
     // Open item 2 as preview
     workspace
-        .update(cx, |workspace, cx| {
-            workspace.open_path_preview(path_2.clone(), None, true, true, cx)
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path_preview(path_2.clone(), None, true, true, window, cx)
         })
         .await
         .unwrap();
@@ -6279,7 +6382,9 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
 
     // Going back should show item 1 as preview
     workspace
-        .update(cx, |workspace, cx| workspace.go_back(pane.downgrade(), cx))
+        .update_in(cx, |workspace, window, cx| {
+            workspace.go_back(pane.downgrade(), window, cx)
+        })
         .await
         .unwrap();
 
@@ -6297,10 +6402,11 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
     });
 
     // Closing item 1
-    pane.update(cx, |pane, cx| {
+    pane.update_in(cx, |pane, window, cx| {
         pane.close_item_by_id(
             pane.active_item().unwrap().item_id(),
             workspace::SaveIntent::Skip,
+            window,
             cx,
         )
     })
@@ -6318,7 +6424,9 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
 
     // Going back should show item 1 as preview
     workspace
-        .update(cx, |workspace, cx| workspace.go_back(pane.downgrade(), cx))
+        .update_in(cx, |workspace, window, cx| {
+            workspace.go_back(pane.downgrade(), window, cx)
+        })
         .await
         .unwrap();
 
@@ -6336,9 +6444,9 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
     });
 
     // Close permanent tab
-    pane.update(cx, |pane, cx| {
+    pane.update_in(cx, |pane, window, cx| {
         let id = pane.items().next().unwrap().item_id();
-        pane.close_item_by_id(id, workspace::SaveIntent::Skip, cx)
+        pane.close_item_by_id(id, workspace::SaveIntent::Skip, window, cx)
     })
     .await
     .unwrap();
@@ -6385,8 +6493,8 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
 
     // Open item 2 as preview in right pane
     workspace
-        .update(cx, |workspace, cx| {
-            workspace.open_path_preview(path_2.clone(), None, true, true, cx)
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path_preview(path_2.clone(), None, true, true, window, cx)
         })
         .await
         .unwrap();
@@ -6417,14 +6525,14 @@ async fn test_preview_tabs(cx: &mut TestAppContext) {
     });
 
     // Focus left pane
-    workspace.update(cx, |workspace, cx| {
-        workspace.activate_pane_in_direction(workspace::SplitDirection::Left, cx)
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.activate_pane_in_direction(workspace::SplitDirection::Left, window, cx)
     });
 
     // Open item 2 as preview in left pane
     workspace
-        .update(cx, |workspace, cx| {
-            workspace.open_path_preview(path_2.clone(), None, true, true, cx)
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path_preview(path_2.clone(), None, true, true, window, cx)
         })
         .await
         .unwrap();
@@ -6487,17 +6595,33 @@ async fn test_context_collaboration_with_reconnect(
         assert_eq!(project.collaborators().len(), 1);
     });
 
+    cx_a.update(context_server::init);
+    cx_b.update(context_server::init);
     let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
     let context_store_a = cx_a
-        .update(|cx| ContextStore::new(project_a.clone(), prompt_builder.clone(), cx))
+        .update(|cx| {
+            ContextStore::new(
+                project_a.clone(),
+                prompt_builder.clone(),
+                Arc::new(SlashCommandWorkingSet::default()),
+                cx,
+            )
+        })
         .await
         .unwrap();
     let context_store_b = cx_b
-        .update(|cx| ContextStore::new(project_b.clone(), prompt_builder.clone(), cx))
+        .update(|cx| {
+            ContextStore::new(
+                project_b.clone(),
+                prompt_builder.clone(),
+                Arc::new(SlashCommandWorkingSet::default()),
+                cx,
+            )
+        })
         .await
         .unwrap();
 
-    // Client A creates a new context.
+    // Client A creates a new chats.
     let context_a = context_store_a.update(cx_a, |store, cx| store.create(cx));
     executor.run_until_parked();
 
@@ -6598,6 +6722,10 @@ async fn test_remote_git_branches(
     client_a
         .fs()
         .insert_branches(Path::new("/project/.git"), &branches);
+    let branches_set = branches
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
 
     let (project_a, worktree_id) = client_a.build_local_project("/project", cx_a).await;
     let project_id = active_call_a
@@ -6619,10 +6747,10 @@ async fn test_remote_git_branches(
 
     let branches_b = branches_b
         .into_iter()
-        .map(|branch| branch.name)
-        .collect::<Vec<_>>();
+        .map(|branch| branch.name.to_string())
+        .collect::<HashSet<_>>();
 
-    assert_eq!(&branches_b, &branches);
+    assert_eq!(branches_b, branches_set);
 
     cx_b.update(|cx| {
         project_b.update(cx, |project, cx| {

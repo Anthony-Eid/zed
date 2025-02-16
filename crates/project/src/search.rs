@@ -1,25 +1,23 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::Result;
 use client::proto;
-use gpui::Model;
-use language::{Buffer, BufferSnapshot};
-use regex::{Captures, Regex, RegexBuilder};
+use fancy_regex::{Captures, Regex, RegexBuilder};
+use gpui::Entity;
+use language::{Buffer, BufferSnapshot, CharKind};
 use smol::future::yield_now;
 use std::{
     borrow::Cow,
     io::{BufRead, BufReader, Read},
     ops::Range,
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock},
 };
 use text::Anchor;
 use util::paths::PathMatcher;
 
-static TEXT_REPLACEMENT_SPECIAL_CHARACTERS_REGEX: OnceLock<Regex> = OnceLock::new();
-
 pub enum SearchResult {
     Buffer {
-        buffer: Model<Buffer>,
+        buffer: Entity<Buffer>,
         ranges: Vec<Range<Anchor>>,
     },
     LimitReached,
@@ -37,7 +35,7 @@ pub struct SearchInputs {
     query: Arc<str>,
     files_to_include: PathMatcher,
     files_to_exclude: PathMatcher,
-    buffers: Option<Vec<Model<Buffer>>>,
+    buffers: Option<Vec<Entity<Buffer>>>,
 }
 
 impl SearchInputs {
@@ -50,7 +48,7 @@ impl SearchInputs {
     pub fn files_to_exclude(&self) -> &PathMatcher {
         &self.files_to_exclude
     }
-    pub fn buffers(&self) -> &Option<Vec<Model<Buffer>>> {
+    pub fn buffers(&self) -> &Option<Vec<Entity<Buffer>>> {
         &self.buffers
     }
 }
@@ -76,6 +74,12 @@ pub enum SearchQuery {
     },
 }
 
+static WORD_MATCH_TEST: LazyLock<Regex> = LazyLock::new(|| {
+    RegexBuilder::new(r"\B")
+        .build()
+        .expect("Failed to create WORD_MATCH_TEST")
+});
+
 impl SearchQuery {
     pub fn text(
         query: impl ToString,
@@ -84,7 +88,7 @@ impl SearchQuery {
         include_ignored: bool,
         files_to_include: PathMatcher,
         files_to_exclude: PathMatcher,
-        buffers: Option<Vec<Model<Buffer>>>,
+        buffers: Option<Vec<Entity<Buffer>>>,
     ) -> Result<Self> {
         let query = query.to_string();
         let search = AhoCorasickBuilder::new()
@@ -113,22 +117,29 @@ impl SearchQuery {
         include_ignored: bool,
         files_to_include: PathMatcher,
         files_to_exclude: PathMatcher,
-        buffers: Option<Vec<Model<Buffer>>>,
+        buffers: Option<Vec<Entity<Buffer>>>,
     ) -> Result<Self> {
         let mut query = query.to_string();
         let initial_query = Arc::from(query.as_str());
         if whole_word {
             let mut word_query = String::new();
-            word_query.push_str("\\b");
+            if let Some(first) = query.get(0..1) {
+                if WORD_MATCH_TEST.is_match(first).is_ok_and(|x| !x) {
+                    word_query.push_str("\\b");
+                }
+            }
             word_query.push_str(&query);
-            word_query.push_str("\\b");
+            if let Some(last) = query.get(query.len() - 1..) {
+                if WORD_MATCH_TEST.is_match(last).is_ok_and(|x| !x) {
+                    word_query.push_str("\\b");
+                }
+            }
             query = word_query
         }
 
         let multiline = query.contains('\n') || query.contains("\\n") || query.contains("\\s");
         let regex = RegexBuilder::new(&query)
             .case_insensitive(!case_sensitive)
-            .multi_line(multiline)
             .build()?;
         let inner = SearchInputs {
             query: initial_query,
@@ -199,14 +210,17 @@ impl SearchQuery {
         }
     }
 
-    pub fn detect<T: Read>(&self, stream: T) -> Result<bool> {
+    pub(crate) fn detect(
+        &self,
+        mut reader: BufReader<Box<dyn Read + Send + Sync>>,
+    ) -> Result<bool> {
         if self.as_str().is_empty() {
             return Ok(false);
         }
 
         match self {
             Self::Text { search, .. } => {
-                let mat = search.stream_find_iter(stream).next();
+                let mat = search.stream_find_iter(reader).next();
                 match mat {
                     Some(Ok(_)) => Ok(true),
                     Some(Err(err)) => Err(err.into()),
@@ -216,18 +230,17 @@ impl SearchQuery {
             Self::Regex {
                 regex, multiline, ..
             } => {
-                let mut reader = BufReader::new(stream);
                 if *multiline {
                     let mut text = String::new();
                     if let Err(err) = reader.read_to_string(&mut text) {
                         Err(err.into())
                     } else {
-                        Ok(regex.find(&text).is_some())
+                        Ok(regex.find(&text)?.is_some())
                     }
                 } else {
                     for line in reader.lines() {
                         let line = line?;
-                        if regex.find(&line).is_some() {
+                        if regex.find(&line)?.is_some() {
                             return Ok(true);
                         }
                     }
@@ -252,16 +265,17 @@ impl SearchQuery {
                 regex, replacement, ..
             } => {
                 if let Some(replacement) = replacement {
-                    let replacement = TEXT_REPLACEMENT_SPECIAL_CHARACTERS_REGEX
-                        .get_or_init(|| Regex::new(r"\\\\|\\n|\\t").unwrap())
-                        .replace_all(replacement, |c: &Captures| {
-                            match c.get(0).unwrap().as_str() {
-                                r"\\" => "\\",
-                                r"\n" => "\n",
-                                r"\t" => "\t",
-                                x => unreachable!("Unexpected escape sequence: {}", x),
-                            }
-                        });
+                    static TEXT_REPLACEMENT_SPECIAL_CHARACTERS_REGEX: LazyLock<Regex> =
+                        LazyLock::new(|| Regex::new(r"\\\\|\\n|\\t").unwrap());
+                    let replacement = TEXT_REPLACEMENT_SPECIAL_CHARACTERS_REGEX.replace_all(
+                        replacement,
+                        |c: &Captures| match c.get(0).unwrap().as_str() {
+                            r"\\" => "\\",
+                            r"\n" => "\n",
+                            r"\t" => "\t",
+                            x => unreachable!("Unexpected escape sequence: {}", x),
+                        },
+                    );
                     Some(regex.replace(text, replacement))
                 } else {
                     None
@@ -314,7 +328,9 @@ impl SearchQuery {
                         let end_kind =
                             classifier.kind(rope.reversed_chars_at(mat.end()).next().unwrap());
                         let next_kind = rope.chars_at(mat.end()).next().map(|c| classifier.kind(c));
-                        if Some(start_kind) == prev_kind || Some(end_kind) == next_kind {
+                        if (Some(start_kind) == prev_kind && start_kind == CharKind::Word)
+                            || (Some(end_kind) == next_kind && end_kind == CharKind::Word)
+                        {
                             continue;
                         }
                     }
@@ -332,7 +348,9 @@ impl SearchQuery {
                             yield_now().await;
                         }
 
-                        matches.push(mat.start()..mat.end());
+                        if let Ok(mat) = mat {
+                            matches.push(mat.start()..mat.end());
+                        }
                     }
                 } else {
                     let mut line = String::new();
@@ -344,7 +362,7 @@ impl SearchQuery {
 
                         for (newline_ix, text) in chunk.split('\n').enumerate() {
                             if newline_ix > 0 {
-                                for mat in regex.find_iter(&line) {
+                                for mat in regex.find_iter(&line).flatten() {
                                     let start = line_offset + mat.start();
                                     let end = line_offset + mat.end();
                                     matches.push(start..end);
@@ -408,7 +426,7 @@ impl SearchQuery {
         self.as_inner().files_to_exclude()
     }
 
-    pub fn buffers(&self) -> Option<&Vec<Model<Buffer>>> {
+    pub fn buffers(&self) -> Option<&Vec<Entity<Buffer>>> {
         self.as_inner().buffers.as_ref()
     }
 

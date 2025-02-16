@@ -77,10 +77,10 @@ impl From<AnyElement> for EmptyMessage {
 }
 
 impl RenderOnce for List {
-    fn render(self, cx: &mut WindowContext) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         v_flex()
             .w_full()
-            .py(Spacing::Small.rems(cx))
+            .py(DynamicSpacing::Base04.rems(cx))
             .children(self.header)
             .map(|this| match (self.children.is_empty(), self.toggle) {
                 (false, _) => this.children(self.children),

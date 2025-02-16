@@ -1,4 +1,6 @@
+mod derive_component;
 mod derive_path_str;
+mod dynamic_spacing;
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -62,7 +64,7 @@ pub fn settings_toggle_render_derive(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl RenderOnce for #name {
-            fn render(self, cx: &mut WindowContext) -> impl IntoElement {
+            fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
                 const _: fn() = || {
                     fn assert_impl<T: EditableSettingControl<Value = bool>>() {}
                     assert_impl::<#name>();
@@ -74,11 +76,11 @@ pub fn settings_toggle_render_derive(input: TokenStream) -> TokenStream {
                     #check_box,
                     Label::new(self.name()),
                     value.into(),
-                    |selection, cx| {
+                    |selection, _window, cx| {
                         Self::write(
                             match selection {
-                                Selection::Selected => true,
-                                Selection::Unselected | Selection::Indeterminate => false,
+                                ToggleState::Selected => true,
+                                ToggleState::Unselected | ToggleState::Indeterminate => false,
                             },
                             cx
                         );
@@ -89,4 +91,34 @@ pub fn settings_toggle_render_derive(input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Generates the DynamicSpacing enum used for density-aware spacing in the UI.
+#[proc_macro]
+pub fn derive_dynamic_spacing(input: TokenStream) -> TokenStream {
+    dynamic_spacing::derive_spacing(input)
+}
+
+/// Derives the `Component` trait for a struct.
+///
+/// This macro generates implementations for the `Component` trait and associated
+/// registration functions for the component system.
+///
+/// # Attributes
+///
+/// - `#[component(scope = "...")]`: Required. Specifies the scope of the component.
+/// - `#[component(description = "...")]`: Optional. Provides a description for the component.
+///
+/// # Example
+///
+/// ```
+/// use ui_macros::Component;
+///
+/// #[derive(Component)]
+/// #[component(scope = "toggle", description = "A element that can be toggled on and off")]
+/// struct Checkbox;
+/// ```
+#[proc_macro_derive(IntoComponent, attributes(component))]
+pub fn derive_component(input: TokenStream) -> TokenStream {
+    derive_component::derive_into_component(input)
 }

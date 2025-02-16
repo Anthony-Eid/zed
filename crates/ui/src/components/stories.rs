@@ -3,7 +3,6 @@
 #![allow(missing_docs)]
 mod avatar;
 mod button;
-mod checkbox;
 mod context_menu;
 mod disclosure;
 mod icon;
@@ -16,11 +15,9 @@ mod list_item;
 mod tab;
 mod tab_bar;
 mod toggle_button;
-mod tool_strip;
 
 pub use avatar::*;
 pub use button::*;
-pub use checkbox::*;
 pub use context_menu::*;
 pub use disclosure::*;
 pub use icon::*;
@@ -33,4 +30,3 @@ pub use list_item::*;
 pub use tab::*;
 pub use tab_bar::*;
 pub use toggle_button::*;
-pub use tool_strip::*;

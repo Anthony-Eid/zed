@@ -1,15 +1,18 @@
+/// todo(windows)
+/// The tests in this file assume that server_cx is running on Windows too.
+/// We neead to find a way to test Windows-Non-Windows interactions.
 use crate::headless_project::HeadlessProject;
 use client::{Client, UserStore};
 use clock::FakeSystemClock;
+use extension::ExtensionHostProxy;
 use fs::{FakeFs, Fs};
-use gpui::{Context, Model, TestAppContext};
+use gpui::{AppContext as _, Entity, SemanticVersion, TestAppContext};
 use http_client::{BlockedHttpClient, FakeHttpClient};
 use language::{
     language_settings::{language_settings, AllLanguageSettings},
-    Buffer, FakeLspAdapter, LanguageConfig, LanguageMatcher, LanguageRegistry, LanguageServerName,
-    LineEnding,
+    Buffer, FakeLspAdapter, LanguageConfig, LanguageMatcher, LanguageRegistry, LineEnding,
 };
-use lsp::{CompletionContext, CompletionResponse, CompletionTriggerKind};
+use lsp::{CompletionContext, CompletionResponse, CompletionTriggerKind, LanguageServerName};
 use node_runtime::NodeRuntime;
 use project::{
     search::{SearchQuery, SearchResult},
@@ -20,15 +23,18 @@ use serde_json::json;
 use settings::{initial_server_settings_content, Settings, SettingsLocation, SettingsStore};
 use smol::stream::StreamExt;
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
+use unindent::Unindent as _;
+use util::{path, separator};
 
 #[gpui::test]
 async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
-        "/code",
+        path!("/code"),
         json!({
             "project1": {
                 ".git": {},
@@ -44,14 +50,14 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
     )
     .await;
     fs.set_index_for_repo(
-        Path::new("/code/project1/.git"),
-        &[(Path::new("src/lib.rs"), "fn one() -> usize { 0 }".into())],
+        Path::new(path!("/code/project1/.git")),
+        &[("src/lib.rs".into(), "fn one() -> usize { 0 }".into())],
     );
 
     let (project, _headless) = init_test(&fs, cx, server_cx).await;
     let (worktree, _) = project
         .update(cx, |project, cx| {
-            project.find_or_create_worktree("/code/project1", true, cx)
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
         })
         .await
         .unwrap();
@@ -78,13 +84,19 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
         })
         .await
         .unwrap();
+    let diff = project
+        .update(cx, |project, cx| {
+            project.open_unstaged_diff(buffer.clone(), cx)
+        })
+        .await
+        .unwrap();
+
+    diff.update(cx, |diff, _| {
+        assert_eq!(diff.base_text_string().unwrap(), "fn one() -> usize { 0 }");
+    });
 
     buffer.update(cx, |buffer, cx| {
         assert_eq!(buffer.text(), "fn one() -> usize { 1 }");
-        assert_eq!(
-            buffer.diff_base().unwrap().to_string(),
-            "fn one() -> usize { 0 }"
-        );
         let ix = buffer.text().find('1').unwrap();
         buffer.edit([(ix..ix + 1, "100")], None, cx);
     });
@@ -103,7 +115,7 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
     // A new file is created in the remote filesystem. The user
     // sees the new file.
     fs.save(
-        "/code/project1/src/main.rs".as_ref(),
+        path!("/code/project1/src/main.rs").as_ref(),
         &"fn main() {}".into(),
         Default::default(),
     )
@@ -124,8 +136,8 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
 
     // A file that is currently open in a buffer is renamed.
     fs.rename(
-        "/code/project1/src/lib.rs".as_ref(),
-        "/code/project1/src/lib2.rs".as_ref(),
+        path!("/code/project1/src/lib.rs").as_ref(),
+        path!("/code/project1/src/lib2.rs").as_ref(),
         Default::default(),
     )
     .await
@@ -136,13 +148,13 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
     });
 
     fs.set_index_for_repo(
-        Path::new("/code/project1/.git"),
-        &[(Path::new("src/lib2.rs"), "fn one() -> usize { 100 }".into())],
+        Path::new(path!("/code/project1/.git")),
+        &[("src/lib2.rs".into(), "fn one() -> usize { 100 }".into())],
     );
     cx.executor().run_until_parked();
-    buffer.update(cx, |buffer, _| {
+    diff.update(cx, |diff, _| {
         assert_eq!(
-            buffer.diff_base().unwrap().to_string(),
+            diff.base_text_string().unwrap(),
             "fn one() -> usize { 100 }"
         );
     });
@@ -152,7 +164,7 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
 async fn test_remote_project_search(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
-        "/code",
+        path!("/code"),
         json!({
             "project1": {
                 ".git": {},
@@ -169,15 +181,15 @@ async fn test_remote_project_search(cx: &mut TestAppContext, server_cx: &mut Tes
 
     project
         .update(cx, |project, cx| {
-            project.find_or_create_worktree("/code/project1", true, cx)
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
         })
         .await
         .unwrap();
 
     cx.run_until_parked();
 
-    async fn do_search(project: &Model<Project>, mut cx: TestAppContext) -> Model<Buffer> {
-        let mut receiver = project.update(&mut cx, |project, cx| {
+    async fn do_search(project: &Entity<Project>, mut cx: TestAppContext) -> Entity<Buffer> {
+        let receiver = project.update(&mut cx, |project, cx| {
             project.search(
                 SearchQuery::text(
                     "project",
@@ -193,18 +205,18 @@ async fn test_remote_project_search(cx: &mut TestAppContext, server_cx: &mut Tes
             )
         });
 
-        let first_response = receiver.next().await.unwrap();
+        let first_response = receiver.recv().await.unwrap();
         let SearchResult::Buffer { buffer, .. } = first_response else {
             panic!("incorrect result");
         };
         buffer.update(&mut cx, |buffer, cx| {
             assert_eq!(
                 buffer.file().unwrap().full_path(cx).to_string_lossy(),
-                "project1/README.md"
+                separator!("project1/README.md")
             )
         });
 
-        assert!(receiver.next().await.is_none());
+        assert!(receiver.recv().await.is_err());
         buffer
     }
 
@@ -213,7 +225,7 @@ async fn test_remote_project_search(cx: &mut TestAppContext, server_cx: &mut Tes
     // test that the headless server is tracking which buffers we have open correctly.
     cx.run_until_parked();
     headless.update(server_cx, |headless, cx| {
-        assert!(!headless.buffer_store.read(cx).shared_buffers().is_empty())
+        assert!(headless.buffer_store.read(cx).has_shared_buffers())
     });
     do_search(&project, cx.clone()).await;
 
@@ -222,7 +234,7 @@ async fn test_remote_project_search(cx: &mut TestAppContext, server_cx: &mut Tes
     });
     cx.run_until_parked();
     headless.update(server_cx, |headless, cx| {
-        assert!(headless.buffer_store.read(cx).shared_buffers().is_empty())
+        assert!(!headless.buffer_store.read(cx).has_shared_buffers())
     });
 
     do_search(&project, cx.clone()).await;
@@ -358,7 +370,7 @@ async fn test_remote_settings(cx: &mut TestAppContext, server_cx: &mut TestAppCo
 async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
-        "/code",
+        path!("/code"),
         json!({
             "project1": {
                 ".git": {},
@@ -374,7 +386,7 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
     let (project, headless) = init_test(&fs, cx, server_cx).await;
 
     fs.insert_tree(
-        "/code/project1/.zed",
+        path!("/code/project1/.zed"),
         json!({
             "settings.json": r#"
           {
@@ -391,7 +403,7 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
     )
     .await;
 
-    cx.update_model(&project, |project, _| {
+    cx.update_entity(&project, |project, _| {
         project.languages().register_test_language(LanguageConfig {
             name: "Rust".into(),
             matcher: LanguageMatcher {
@@ -421,7 +433,7 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
 
     let worktree_id = project
         .update(cx, |project, cx| {
-            project.find_or_create_worktree("/code/project1", true, cx)
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
         })
         .await
         .unwrap()
@@ -431,9 +443,9 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
     // Wait for the settings to synchronize
     cx.run_until_parked();
 
-    let buffer = project
+    let (buffer, _handle) = project
         .update(cx, |project, cx| {
-            project.open_buffer((worktree_id, Path::new("src/lib.rs")), cx)
+            project.open_buffer_with_lsp((worktree_id, Path::new("src/lib.rs")), cx)
         })
         .await
         .unwrap();
@@ -502,7 +514,7 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
         Ok(Some(lsp::WorkspaceEdit {
             changes: Some(
                 [(
-                    lsp::Url::from_file_path("/code/project1/src/lib.rs").unwrap(),
+                    lsp::Url::from_file_path(path!("/code/project1/src/lib.rs")).unwrap(),
                     vec![lsp::TextEdit::new(
                         lsp::Range::new(lsp::Position::new(0, 3), lsp::Position::new(0, 6)),
                         "two".to_string(),
@@ -529,10 +541,176 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn test_remote_cancel_language_server_work(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code"),
+        json!({
+            "project1": {
+                ".git": {},
+                "README.md": "# project 1",
+                "src": {
+                    "lib.rs": "fn one() -> usize { 1 }"
+                }
+            },
+        }),
+    )
+    .await;
+
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+
+    fs.insert_tree(
+        path!("/code/project1/.zed"),
+        json!({
+            "settings.json": r#"
+          {
+            "languages": {"Rust":{"language_servers":["rust-analyzer"]}},
+            "lsp": {
+              "rust-analyzer": {
+                "binary": {
+                  "path": "~/.cargo/bin/rust-analyzer"
+                }
+              }
+            }
+          }"#
+        }),
+    )
+    .await;
+
+    cx.update_entity(&project, |project, _| {
+        project.languages().register_test_language(LanguageConfig {
+            name: "Rust".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["rs".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        project.languages().register_fake_lsp_adapter(
+            "Rust",
+            FakeLspAdapter {
+                name: "rust-analyzer",
+                ..Default::default()
+            },
+        )
+    });
+
+    let mut fake_lsp = server_cx.update(|cx| {
+        headless.read(cx).languages.register_fake_language_server(
+            LanguageServerName("rust-analyzer".into()),
+            Default::default(),
+            None,
+        )
+    });
+
+    cx.run_until_parked();
+
+    let worktree_id = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap()
+        .0
+        .read_with(cx, |worktree, _| worktree.id());
+
+    cx.run_until_parked();
+
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_buffer_with_lsp((worktree_id, Path::new("src/lib.rs")), cx)
+        })
+        .await
+        .unwrap();
+
+    cx.run_until_parked();
+
+    let mut fake_lsp = fake_lsp.next().await.unwrap();
+
+    // Cancelling all language server work for a given buffer
+    {
+        // Two operations, one cancellable and one not.
+        fake_lsp
+            .start_progress_with(
+                "another-token",
+                lsp::WorkDoneProgressBegin {
+                    cancellable: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let progress_token = "the-progress-token";
+        fake_lsp
+            .start_progress_with(
+                progress_token,
+                lsp::WorkDoneProgressBegin {
+                    cancellable: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        cx.executor().run_until_parked();
+
+        project.update(cx, |project, cx| {
+            project.cancel_language_server_work_for_buffers([buffer.clone()], cx)
+        });
+
+        cx.executor().run_until_parked();
+
+        // Verify the cancellation was received on the server side
+        let cancel_notification = fake_lsp
+            .receive_notification::<lsp::notification::WorkDoneProgressCancel>()
+            .await;
+        assert_eq!(
+            cancel_notification.token,
+            lsp::NumberOrString::String(progress_token.into())
+        );
+    }
+
+    // Cancelling work by server_id and token
+    {
+        let server_id = fake_lsp.server.server_id();
+        let progress_token = "the-progress-token";
+
+        fake_lsp
+            .start_progress_with(
+                progress_token,
+                lsp::WorkDoneProgressBegin {
+                    cancellable: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        cx.executor().run_until_parked();
+
+        project.update(cx, |project, cx| {
+            project.cancel_language_server_work(server_id, Some(progress_token.into()), cx)
+        });
+
+        cx.executor().run_until_parked();
+
+        // Verify the cancellation was received on the server side
+        let cancel_notification = fake_lsp
+            .receive_notification::<lsp::notification::WorkDoneProgressCancel>()
+            .await;
+        assert_eq!(
+            cancel_notification.token,
+            lsp::NumberOrString::String(progress_token.into())
+        );
+    }
+}
+
+#[gpui::test]
 async fn test_remote_reload(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
-        "/code",
+        path!("/code"),
         json!({
             "project1": {
                 ".git": {},
@@ -548,7 +726,7 @@ async fn test_remote_reload(cx: &mut TestAppContext, server_cx: &mut TestAppCont
     let (project, _headless) = init_test(&fs, cx, server_cx).await;
     let (worktree, _) = project
         .update(cx, |project, cx| {
-            project.find_or_create_worktree("/code/project1", true, cx)
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
         })
         .await
         .unwrap();
@@ -563,7 +741,7 @@ async fn test_remote_reload(cx: &mut TestAppContext, server_cx: &mut TestAppCont
         .unwrap();
 
     fs.save(
-        &PathBuf::from("/code/project1/src/lib.rs"),
+        &PathBuf::from(path!("/code/project1/src/lib.rs")),
         &("bangles".to_string().into()),
         LineEnding::Unix,
     )
@@ -578,7 +756,7 @@ async fn test_remote_reload(cx: &mut TestAppContext, server_cx: &mut TestAppCont
     });
 
     fs.save(
-        &PathBuf::from("/code/project1/src/lib.rs"),
+        &PathBuf::from(path!("/code/project1/src/lib.rs")),
         &("bloop".to_string().into()),
         LineEnding::Unix,
     )
@@ -604,7 +782,81 @@ async fn test_remote_reload(cx: &mut TestAppContext, server_cx: &mut TestAppCont
 }
 
 #[gpui::test]
-async fn test_remote_resolve_file_path(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+async fn test_remote_resolve_path_in_buffer(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code"),
+        json!({
+            "project1": {
+                ".git": {},
+                "README.md": "# project 1",
+                "src": {
+                    "lib.rs": "fn one() -> usize { 1 }"
+                }
+            },
+        }),
+    )
+    .await;
+
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+
+    let worktree_id = cx.update(|cx| worktree.read(cx).id());
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, Path::new("src/lib.rs")), cx)
+        })
+        .await
+        .unwrap();
+
+    let path = project
+        .update(cx, |project, cx| {
+            project.resolve_path_in_buffer(path!("/code/project1/README.md"), &buffer, cx)
+        })
+        .await
+        .unwrap();
+    assert!(path.is_file());
+    assert_eq!(
+        path.abs_path().unwrap().to_string_lossy(),
+        path!("/code/project1/README.md")
+    );
+
+    let path = project
+        .update(cx, |project, cx| {
+            project.resolve_path_in_buffer("../README.md", &buffer, cx)
+        })
+        .await
+        .unwrap();
+    assert!(path.is_file());
+    assert_eq!(
+        path.project_path().unwrap().clone(),
+        ProjectPath::from((worktree_id, "README.md"))
+    );
+
+    let path = project
+        .update(cx, |project, cx| {
+            project.resolve_path_in_buffer("../src", &buffer, cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        path.project_path().unwrap().clone(),
+        ProjectPath::from((worktree_id, "src"))
+    );
+    assert!(path.is_dir());
+}
+
+#[gpui::test]
+async fn test_remote_resolve_abs_path(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
         "/code",
@@ -621,28 +873,15 @@ async fn test_remote_resolve_file_path(cx: &mut TestAppContext, server_cx: &mut 
     .await;
 
     let (project, _headless) = init_test(&fs, cx, server_cx).await;
-    let (worktree, _) = project
-        .update(cx, |project, cx| {
-            project.find_or_create_worktree("/code/project1", true, cx)
-        })
-        .await
-        .unwrap();
-
-    let worktree_id = cx.update(|cx| worktree.read(cx).id());
-
-    let buffer = project
-        .update(cx, |project, cx| {
-            project.open_buffer((worktree_id, Path::new("src/lib.rs")), cx)
-        })
-        .await
-        .unwrap();
 
     let path = project
         .update(cx, |project, cx| {
-            project.resolve_existing_file_path("/code/project1/README.md", &buffer, cx)
+            project.resolve_abs_path("/code/project1/README.md", cx)
         })
         .await
         .unwrap();
+
+    assert!(path.is_file());
     assert_eq!(
         path.abs_path().unwrap().to_string_lossy(),
         "/code/project1/README.md"
@@ -650,15 +889,23 @@ async fn test_remote_resolve_file_path(cx: &mut TestAppContext, server_cx: &mut 
 
     let path = project
         .update(cx, |project, cx| {
-            project.resolve_existing_file_path("../README.md", &buffer, cx)
+            project.resolve_abs_path("/code/project1/src", cx)
         })
         .await
         .unwrap();
 
+    assert!(path.is_dir());
     assert_eq!(
-        path.project_path().unwrap().clone(),
-        ProjectPath::from((worktree_id, "README.md"))
+        path.abs_path().unwrap().to_string_lossy(),
+        "/code/project1/src"
     );
+
+    let path = project
+        .update(cx, |project, cx| {
+            project.resolve_abs_path("/code/project1/DOESNOTEXIST", cx)
+        })
+        .await;
+    assert!(path.is_none());
 }
 
 #[gpui::test(iterations = 10)]
@@ -768,7 +1015,7 @@ async fn test_adding_then_removing_then_adding_worktrees(
 async fn test_open_server_settings(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
-        "/code",
+        path!("/code"),
         json!({
             "project1": {
                 ".git": {},
@@ -790,7 +1037,9 @@ async fn test_open_server_settings(cx: &mut TestAppContext, server_cx: &mut Test
     cx.update(|cx| {
         assert_eq!(
             buffer.read(cx).text(),
-            initial_server_settings_content().to_string()
+            initial_server_settings_content()
+                .to_string()
+                .replace("\r\n", "\n")
         )
     })
 }
@@ -799,7 +1048,7 @@ async fn test_open_server_settings(cx: &mut TestAppContext, server_cx: &mut Test
 async fn test_reconnect(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
-        "/code",
+        path!("/code"),
         json!({
             "project1": {
                 ".git": {},
@@ -816,7 +1065,7 @@ async fn test_reconnect(cx: &mut TestAppContext, server_cx: &mut TestAppContext)
 
     let (worktree, _) = project
         .update(cx, |project, cx| {
-            project.find_or_create_worktree("/code/project1", true, cx)
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
         })
         .await
         .unwrap();
@@ -846,9 +1095,206 @@ async fn test_reconnect(cx: &mut TestAppContext, server_cx: &mut TestAppContext)
         .unwrap();
 
     assert_eq!(
-        fs.load("/code/project1/src/lib.rs".as_ref()).await.unwrap(),
+        fs.load(path!("/code/project1/src/lib.rs").as_ref())
+            .await
+            .unwrap(),
         "fn one() -> usize { 100 }"
     );
+}
+
+#[gpui::test]
+async fn test_remote_root_rename(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        "/code",
+        json!({
+            "project1": {
+                ".git": {},
+                "README.md": "# project 1",
+            },
+        }),
+    )
+    .await;
+
+    let (project, _) = init_test(&fs, cx, server_cx).await;
+
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree("/code/project1", true, cx)
+        })
+        .await
+        .unwrap();
+
+    cx.run_until_parked();
+
+    fs.rename(
+        &PathBuf::from("/code/project1"),
+        &PathBuf::from("/code/project2"),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+
+    cx.run_until_parked();
+    worktree.update(cx, |worktree, _| {
+        assert_eq!(worktree.root_name(), "project2")
+    })
+}
+
+#[gpui::test]
+async fn test_remote_rename_entry(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        "/code",
+        json!({
+            "project1": {
+                ".git": {},
+                "README.md": "# project 1",
+            },
+        }),
+    )
+    .await;
+
+    let (project, _) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree("/code/project1", true, cx)
+        })
+        .await
+        .unwrap();
+
+    cx.run_until_parked();
+
+    let entry = worktree
+        .update(cx, |worktree, cx| {
+            let entry = worktree.entry_for_path("README.md").unwrap();
+            worktree.rename_entry(entry.id, Path::new("README.rst"), cx)
+        })
+        .await
+        .unwrap()
+        .to_included()
+        .unwrap();
+
+    cx.run_until_parked();
+
+    worktree.update(cx, |worktree, _| {
+        assert_eq!(worktree.entry_for_path("README.rst").unwrap().id, entry.id)
+    });
+}
+
+#[gpui::test]
+async fn test_remote_git_diffs(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+    let text_2 = "
+        fn one() -> usize {
+            1
+        }
+    "
+    .unindent();
+    let text_1 = "
+        fn one() -> usize {
+            0
+        }
+    "
+    .unindent();
+
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        "/code",
+        json!({
+            "project1": {
+                ".git": {},
+                "src": {
+                    "lib.rs": text_2
+                },
+                "README.md": "# project 1",
+            },
+        }),
+    )
+    .await;
+    fs.set_index_for_repo(
+        Path::new("/code/project1/.git"),
+        &[("src/lib.rs".into(), text_1.clone())],
+    );
+    fs.set_head_for_repo(
+        Path::new("/code/project1/.git"),
+        &[("src/lib.rs".into(), text_1.clone())],
+    );
+
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree("/code/project1", true, cx)
+        })
+        .await
+        .unwrap();
+    let worktree_id = cx.update(|cx| worktree.read(cx).id());
+    cx.executor().run_until_parked();
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, Path::new("src/lib.rs")), cx)
+        })
+        .await
+        .unwrap();
+    let diff = project
+        .update(cx, |project, cx| {
+            project.open_uncommitted_diff(buffer.clone(), cx)
+        })
+        .await
+        .unwrap();
+
+    diff.read_with(cx, |diff, cx| {
+        assert_eq!(diff.base_text_string().unwrap(), text_1);
+        assert_eq!(
+            diff.unstaged_diff
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .base_text_string()
+                .unwrap(),
+            text_1
+        );
+    });
+
+    // stage the current buffer's contents
+    fs.set_index_for_repo(
+        Path::new("/code/project1/.git"),
+        &[("src/lib.rs".into(), text_2.clone())],
+    );
+
+    cx.executor().run_until_parked();
+    diff.read_with(cx, |diff, cx| {
+        assert_eq!(diff.base_text_string().unwrap(), text_1);
+        assert_eq!(
+            diff.unstaged_diff
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .base_text_string()
+                .unwrap(),
+            text_2
+        );
+    });
+
+    // commit the current buffer's contents
+    fs.set_head_for_repo(
+        Path::new("/code/project1/.git"),
+        &[("src/lib.rs".into(), text_2.clone())],
+    );
+
+    cx.executor().run_until_parked();
+    diff.read_with(cx, |diff, cx| {
+        assert_eq!(diff.base_text_string().unwrap(), text_2);
+        assert_eq!(
+            diff.unstaged_diff
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .base_text_string()
+                .unwrap(),
+            text_2
+        );
+    });
 }
 
 #[gpui::test]
@@ -867,6 +1313,10 @@ async fn test_remote_git_branches(cx: &mut TestAppContext, server_cx: &mut TestA
 
     let (project, headless_project) = init_test(&fs, cx, server_cx).await;
     let branches = ["main", "dev", "feature-1"];
+    let branches_set = branches
+        .iter()
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
     fs.insert_branches(Path::new("/code/project1/.git"), &branches);
 
     let (worktree, _) = project
@@ -890,10 +1340,10 @@ async fn test_remote_git_branches(cx: &mut TestAppContext, server_cx: &mut TestA
 
     let remote_branches = remote_branches
         .into_iter()
-        .map(|branch| branch.name)
-        .collect::<Vec<_>>();
+        .map(|branch| branch.name.to_string())
+        .collect::<HashSet<_>>();
 
-    assert_eq!(&remote_branches, &branches);
+    assert_eq!(&remote_branches, &branches_set);
 
     cx.update(|cx| {
         project.update(cx, |project, cx| {
@@ -947,16 +1397,23 @@ pub async fn init_test(
     server_fs: &Arc<FakeFs>,
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,
-) -> (Model<Project>, Model<HeadlessProject>) {
+) -> (Entity<Project>, Entity<HeadlessProject>) {
     let server_fs = server_fs.clone();
+    cx.update(|cx| {
+        release_channel::init(SemanticVersion::default(), cx);
+    });
+    server_cx.update(|cx| {
+        release_channel::init(SemanticVersion::default(), cx);
+    });
     init_logger();
 
     let (opts, ssh_server_client) = SshRemoteClient::fake_server(cx, server_cx);
     let http_client = Arc::new(BlockedHttpClient);
     let node_runtime = NodeRuntime::unavailable();
     let languages = Arc::new(LanguageRegistry::new(cx.executor()));
+    let proxy = Arc::new(ExtensionHostProxy::new());
     server_cx.update(HeadlessProject::init);
-    let headless = server_cx.new_model(|cx| {
+    let headless = server_cx.new(|cx| {
         client::init_settings(cx);
 
         HeadlessProject::new(
@@ -966,6 +1423,7 @@ pub async fn init_test(
                 http_client,
                 node_runtime,
                 languages,
+                extension_host_proxy: proxy,
             },
             cx,
         )
@@ -988,7 +1446,7 @@ fn init_logger() {
     }
 }
 
-fn build_project(ssh: Model<SshRemoteClient>, cx: &mut TestAppContext) -> Model<Project> {
+fn build_project(ssh: Entity<SshRemoteClient>, cx: &mut TestAppContext) -> Entity<Project> {
     cx.update(|cx| {
         if !cx.has_global::<SettingsStore>() {
             let settings_store = SettingsStore::test(cx);
@@ -998,14 +1456,14 @@ fn build_project(ssh: Model<SshRemoteClient>, cx: &mut TestAppContext) -> Model<
 
     let client = cx.update(|cx| {
         Client::new(
-            Arc::new(FakeSystemClock::default()),
+            Arc::new(FakeSystemClock::new()),
             FakeHttpClient::with_404_response(),
             cx,
         )
     });
 
     let node = NodeRuntime::unavailable();
-    let user_store = cx.new_model(|cx| UserStore::new(client.clone(), cx));
+    let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
     let languages = Arc::new(LanguageRegistry::test(cx.executor()));
     let fs = FakeFs::new(cx.executor());
 

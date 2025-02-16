@@ -9,7 +9,8 @@ use http_client::{HttpClient, Uri};
 use semver::Version;
 use serde::Deserialize;
 use smol::io::BufReader;
-use smol::{fs, lock::Mutex, process::Command};
+use smol::{fs, lock::Mutex};
+use std::env;
 use std::ffi::OsString;
 use std::io;
 use std::process::{Output, Stdio};
@@ -20,8 +21,7 @@ use std::{
 };
 use util::ResultExt;
 
-#[cfg(windows)]
-use smol::process::windows::CommandExt;
+const NODE_CA_CERTS_ENV_VAR: &str = "NODE_EXTRA_CA_CERTS";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NodeBinaryOptions {
@@ -161,6 +161,10 @@ impl NodeRuntime {
         directory: &Path,
         packages: &[(&str, &str)],
     ) -> Result<()> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
         let packages: Vec<_> = packages
             .iter()
             .map(|(name, version)| format!("{name}@{version}"))
@@ -310,11 +314,11 @@ impl ManagedNodeRuntime {
         let node_dir = node_containing_dir.join(folder_name);
         let node_binary = node_dir.join(Self::NODE_PATH);
         let npm_file = node_dir.join(Self::NPM_PATH);
+        let node_ca_certs = env::var(NODE_CA_CERTS_ENV_VAR).unwrap_or_else(|_| String::new());
 
-        let mut command = Command::new(&node_binary);
-
-        command
+        let result = util::command::new_smol_command(&node_binary)
             .env_clear()
+            .env(NODE_CA_CERTS_ENV_VAR, node_ca_certs)
             .arg(npm_file)
             .arg("--version")
             .stdin(Stdio::null())
@@ -322,12 +326,9 @@ impl ManagedNodeRuntime {
             .stderr(Stdio::null())
             .args(["--cache".into(), node_dir.join("cache")])
             .args(["--userconfig".into(), node_dir.join("blank_user_npmrc")])
-            .args(["--globalconfig".into(), node_dir.join("blank_global_npmrc")]);
-
-        #[cfg(windows)]
-        command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
-
-        let result = command.status().await;
+            .args(["--globalconfig".into(), node_dir.join("blank_global_npmrc")])
+            .status()
+            .await;
         let valid = matches!(result, Ok(status) if status.success());
 
         if !valid {
@@ -408,9 +409,12 @@ impl NodeRuntimeTrait for ManagedNodeRuntime {
                 return Err(anyhow!("missing npm file"));
             }
 
-            let mut command = Command::new(node_binary);
+            let node_ca_certs = env::var(NODE_CA_CERTS_ENV_VAR).unwrap_or_else(|_| String::new());
+
+            let mut command = util::command::new_smol_command(node_binary);
             command.env_clear();
             command.env("PATH", env_path);
+            command.env(NODE_CA_CERTS_ENV_VAR, node_ca_certs);
             command.arg(npm_file).arg(subcommand);
             command.args(["--cache".into(), self.installation_path.join("cache")]);
             command.args([
@@ -469,7 +473,7 @@ pub struct SystemNodeRuntime {
 impl SystemNodeRuntime {
     const MIN_VERSION: semver::Version = Version::new(18, 0, 0);
     async fn new(node: PathBuf, npm: PathBuf) -> Result<Box<dyn NodeRuntimeTrait>> {
-        let output = Command::new(&node)
+        let output = util::command::new_smol_command(&node)
             .arg("--version")
             .output()
             .await
@@ -539,10 +543,12 @@ impl NodeRuntimeTrait for SystemNodeRuntime {
         subcommand: &str,
         args: &[&str],
     ) -> anyhow::Result<Output> {
-        let mut command = Command::new(self.npm.clone());
+        let node_ca_certs = env::var(NODE_CA_CERTS_ENV_VAR).unwrap_or_else(|_| String::new());
+        let mut command = util::command::new_smol_command(self.npm.clone());
         command
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env(NODE_CA_CERTS_ENV_VAR, node_ca_certs)
             .arg(subcommand)
             .args(["--cache".into(), self.scratch_dir.join("cache")])
             .args([
@@ -635,7 +641,11 @@ impl NodeRuntimeTrait for UnavailableNodeRuntime {
     }
 }
 
-fn configure_npm_command(command: &mut Command, directory: Option<&Path>, proxy: Option<&Uri>) {
+fn configure_npm_command(
+    command: &mut smol::process::Command,
+    directory: Option<&Path>,
+    proxy: Option<&Uri>,
+) {
     if let Some(directory) = directory {
         command.current_dir(directory);
         command.args(["--prefix".into(), directory.to_path_buf()]);
@@ -670,6 +680,5 @@ fn configure_npm_command(command: &mut Command, directory: Option<&Path>, proxy:
         {
             command.env("ComSpec", val);
         }
-        command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
     }
 }

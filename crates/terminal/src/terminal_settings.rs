@@ -3,7 +3,7 @@ use alacritty_terminal::vte::ansi::{
 };
 use collections::HashMap;
 use gpui::{
-    px, AbsoluteLength, AppContext, FontFallbacks, FontFeatures, FontWeight, Pixels, SharedString,
+    px, AbsoluteLength, App, FontFallbacks, FontFeatures, FontWeight, Pixels, SharedString,
 };
 use schemars::{gen::SchemaGenerator, schema::RootSchema, JsonSchema};
 use serde_derive::{Deserialize, Serialize};
@@ -21,10 +21,10 @@ pub enum TerminalDockPosition {
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Toolbar {
-    pub title: bool,
+    pub breadcrumbs: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TerminalSettings {
     pub shell: Shell,
     pub working_directory: WorkingDirectory,
@@ -47,6 +47,40 @@ pub struct TerminalSettings {
     pub detect_venv: VenvSettings,
     pub max_scroll_history_lines: Option<usize>,
     pub toolbar: Toolbar,
+    pub scrollbar: ScrollbarSettings,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ScrollbarSettings {
+    /// When to show the scrollbar in the terminal.
+    ///
+    /// Default: inherits editor scrollbar settings
+    pub show: Option<ShowScrollbar>,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ScrollbarSettingsContent {
+    /// When to show the scrollbar in the terminal.
+    ///
+    /// Default: inherits editor scrollbar settings
+    pub show: Option<Option<ShowScrollbar>>,
+}
+
+/// When to show the scrollbar in the terminal.
+///
+/// Default: auto
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowScrollbar {
+    /// Show the scrollbar if there's important information or
+    /// follow the system's configured behavior.
+    Auto,
+    /// Match the system's configured behavior.
+    System,
+    /// Always show the scrollbar.
+    Always,
+    /// Never show the scrollbar.
+    Never,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -187,6 +221,8 @@ pub struct TerminalSettingsContent {
     pub max_scroll_history_lines: Option<usize>,
     /// Toolbar related settings
     pub toolbar: Option<ToolbarContent>,
+    /// Scrollbar-related settings
+    pub scrollbar: Option<ScrollbarSettingsContent>,
 }
 
 impl settings::Settings for TerminalSettings {
@@ -194,17 +230,14 @@ impl settings::Settings for TerminalSettings {
 
     type FileContent = TerminalSettingsContent;
 
-    fn load(
-        sources: SettingsSources<Self::FileContent>,
-        _: &mut AppContext,
-    ) -> anyhow::Result<Self> {
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> anyhow::Result<Self> {
         sources.json_merge()
     }
 
     fn json_schema(
         generator: &mut SchemaGenerator,
         params: &SettingsJsonSchemaParams,
-        _: &AppContext,
+        _: &App,
     ) -> RootSchema {
         let mut root_schema = generator.root_schema_for::<Self::FileContent>();
         root_schema.definitions.extend([
@@ -286,10 +319,14 @@ pub enum WorkingDirectory {
 // Toolbar related settings
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ToolbarContent {
-    /// Whether to display the terminal title in its toolbar.
+    /// Whether to display the terminal title in breadcrumbs inside the terminal pane.
+    /// Only shown if the terminal title is not empty.
+    ///
+    /// The shell running in the terminal needs to be configured to emit the title.
+    /// Example: `echo -e "\e]2;New Title\007";`
     ///
     /// Default: true
-    pub title: Option<bool>,
+    pub breadcrumbs: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

@@ -6,7 +6,21 @@ Extensions can add the following capabilities to Zed:
 
 - [Languages](./languages.md)
 - [Themes](./themes.md)
+- [Icon Themes](./icon-themes.md)
 - [Slash Commands](./slash-commands.md)
+- [Context Servers](./context-servers.md)
+
+## Developing an Extension Locally
+
+Before starting to develop an extension for Zed, be sure to [install Rust via rustup](https://www.rust-lang.org/tools/install).
+
+> Rust must be installed via rustup. If you have Rust installed via homebrew or otherwise, installing dev extensions will not work.
+
+When developing an extension, you can use it in Zed without needing to publish it by installing it as a _dev extension_.
+
+From the extensions page, click the `Install Dev Extension` button and select the directory containing your extension.
+
+If you already have a published extension with the same name installed, your dev extension will override it.
 
 ## Directory Structure of a Zed Extension
 
@@ -74,16 +88,6 @@ impl zed::Extension for MyExtension {
 zed::register_extension!(MyExtension);
 ```
 
-## Developing an Extension Locally
-
-Before starting to develop an extension for Zed, be sure to [install Rust](https://www.rust-lang.org/tools/install).
-
-When developing an extension, you can use it in Zed without needing to publish it by installing it as a _dev extension_.
-
-From the extensions page, click the `Install Dev Extension` button and select the directory containing your extension.
-
-If you already have a published extension with the same name installed, your dev extension will override it.
-
 ## Publishing your extension
 
 To publish an extension, open a PR to [the `zed-industries/extensions` repo](https://github.com/zed-industries/extensions).
@@ -93,6 +97,12 @@ To publish an extension, open a PR to [the `zed-industries/extensions` repo](htt
 In your PR, do the following:
 
 1. Add your extension as a Git submodule within the `extensions/` directory
+
+```sh
+git submodule add https://github.com/your-username/foobar-zed.git extensions/foobar
+git add extensions/foobar
+```
+
 2. Add a new entry to the top-level `extensions.toml` file containing your extension:
 
 ```toml

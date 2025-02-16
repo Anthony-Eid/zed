@@ -1,20 +1,26 @@
+mod extension_slash_command;
 mod slash_command_registry;
+mod slash_command_working_set;
 
+pub use crate::extension_slash_command::*;
+pub use crate::slash_command_registry::*;
+pub use crate::slash_command_working_set::*;
 use anyhow::Result;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
-use gpui::{AnyElement, AppContext, ElementId, SharedString, Task, WeakView, WindowContext};
+use gpui::{App, SharedString, Task, WeakEntity, Window};
 use language::{BufferSnapshot, CodeLabel, LspAdapterDelegate, OffsetRangeExt};
+pub use language_model::Role;
 use serde::{Deserialize, Serialize};
-pub use slash_command_registry::*;
 use std::{
     ops::Range,
     sync::{atomic::AtomicBool, Arc},
 };
 use workspace::{ui::IconName, Workspace};
 
-pub fn init(cx: &mut AppContext) {
+pub fn init(cx: &mut App) {
     SlashCommandRegistry::default_global(cx);
+    extension_slash_command::init(cx);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +68,10 @@ pub type SlashCommandResult = Result<BoxStream<'static, Result<SlashCommandEvent
 
 pub trait SlashCommand: 'static + Send + Sync {
     fn name(&self) -> String;
-    fn label(&self, _cx: &AppContext) -> CodeLabel {
+    fn icon(&self) -> IconName {
+        IconName::Slash
+    }
+    fn label(&self, _cx: &App) -> CodeLabel {
         CodeLabel::plain(self.name(), None)
     }
     fn description(&self) -> String;
@@ -71,36 +80,33 @@ pub trait SlashCommand: 'static + Send + Sync {
         self: Arc<Self>,
         arguments: &[String],
         cancel: Arc<AtomicBool>,
-        workspace: Option<WeakView<Workspace>>,
-        cx: &mut WindowContext,
+        workspace: Option<WeakEntity<Workspace>>,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Task<Result<Vec<ArgumentCompletion>>>;
     fn requires_argument(&self) -> bool;
     fn accepts_arguments(&self) -> bool {
         self.requires_argument()
     }
+    #[allow(clippy::too_many_arguments)]
     fn run(
         self: Arc<Self>,
         arguments: &[String],
         context_slash_command_output_sections: &[SlashCommandOutputSection<language::Anchor>],
         context_buffer: BufferSnapshot,
-        workspace: WeakView<Workspace>,
+        workspace: WeakEntity<Workspace>,
         // TODO: We're just using the `LspAdapterDelegate` here because that is
         // what the extension API is already expecting.
         //
         // It may be that `LspAdapterDelegate` needs a more general name, or
         // perhaps another kind of delegate is needed here.
         delegate: Option<Arc<dyn LspAdapterDelegate>>,
-        cx: &mut WindowContext,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Task<SlashCommandResult>;
 }
 
-pub type RenderFoldPlaceholder = Arc<
-    dyn Send
-        + Sync
-        + Fn(ElementId, Arc<dyn Fn(&mut WindowContext)>, &mut WindowContext) -> AnyElement,
->;
-
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum SlashCommandContent {
     Text {
         text: String,
@@ -108,17 +114,28 @@ pub enum SlashCommandContent {
     },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+impl<'a> From<&'a str> for SlashCommandContent {
+    fn from(text: &'a str) -> Self {
+        Self::Text {
+            text: text.into(),
+            run_commands_in_text: false,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub enum SlashCommandEvent {
+    StartMessage {
+        role: Role,
+        merge_same_roles: bool,
+    },
     StartSection {
         icon: IconName,
         label: SharedString,
         metadata: Option<serde_json::Value>,
     },
     Content(SlashCommandContent),
-    EndSection {
-        metadata: Option<serde_json::Value>,
-    },
+    EndSection,
 }
 
 #[derive(Debug, Default, PartialEq, Clone)]
@@ -147,43 +164,37 @@ impl SlashCommandOutput {
         self.ensure_valid_section_ranges();
 
         let mut events = Vec::new();
-        let mut last_section_end = 0;
 
+        let mut section_endpoints = Vec::new();
         for section in self.sections {
-            if last_section_end < section.range.start {
+            section_endpoints.push((
+                section.range.start,
+                SlashCommandEvent::StartSection {
+                    icon: section.icon,
+                    label: section.label,
+                    metadata: section.metadata,
+                },
+            ));
+            section_endpoints.push((section.range.end, SlashCommandEvent::EndSection));
+        }
+        section_endpoints.sort_by_key(|(offset, _)| *offset);
+
+        let mut content_offset = 0;
+        for (endpoint_offset, endpoint) in section_endpoints {
+            if content_offset < endpoint_offset {
                 events.push(Ok(SlashCommandEvent::Content(SlashCommandContent::Text {
-                    text: self
-                        .text
-                        .get(last_section_end..section.range.start)
-                        .unwrap_or_default()
-                        .to_string(),
+                    text: self.text[content_offset..endpoint_offset].to_string(),
                     run_commands_in_text: self.run_commands_in_text,
                 })));
+                content_offset = endpoint_offset;
             }
 
-            events.push(Ok(SlashCommandEvent::StartSection {
-                icon: section.icon,
-                label: section.label,
-                metadata: section.metadata.clone(),
-            }));
-            events.push(Ok(SlashCommandEvent::Content(SlashCommandContent::Text {
-                text: self
-                    .text
-                    .get(section.range.start..section.range.end)
-                    .unwrap_or_default()
-                    .to_string(),
-                run_commands_in_text: self.run_commands_in_text,
-            })));
-            events.push(Ok(SlashCommandEvent::EndSection {
-                metadata: section.metadata,
-            }));
-
-            last_section_end = section.range.end;
+            events.push(Ok(endpoint));
         }
 
-        if last_section_end < self.text.len() {
+        if content_offset < self.text.len() {
             events.push(Ok(SlashCommandEvent::Content(SlashCommandContent::Text {
-                text: self.text[last_section_end..].to_string(),
+                text: self.text[content_offset..].to_string(),
                 run_commands_in_text: self.run_commands_in_text,
             })));
         }
@@ -223,12 +234,12 @@ impl SlashCommandOutput {
                         section.range.end = output.text.len();
                     }
                 }
-                SlashCommandEvent::EndSection { metadata } => {
-                    if let Some(mut section) = section_stack.pop() {
-                        section.metadata = metadata;
+                SlashCommandEvent::EndSection => {
+                    if let Some(section) = section_stack.pop() {
                         output.sections.push(section);
                     }
                 }
+                SlashCommandEvent::StartMessage { .. } => {}
             }
         }
 
@@ -251,6 +262,67 @@ pub struct SlashCommandOutputSection<T> {
 impl SlashCommandOutputSection<language::Anchor> {
     pub fn is_valid(&self, buffer: &language::TextBuffer) -> bool {
         self.range.start.is_valid(buffer) && !self.range.to_offset(buffer).is_empty()
+    }
+}
+
+pub struct SlashCommandLine {
+    /// The range within the line containing the command name.
+    pub name: Range<usize>,
+    /// Ranges within the line containing the command arguments.
+    pub arguments: Vec<Range<usize>>,
+}
+
+impl SlashCommandLine {
+    pub fn parse(line: &str) -> Option<Self> {
+        let mut call: Option<Self> = None;
+        let mut ix = 0;
+        for c in line.chars() {
+            let next_ix = ix + c.len_utf8();
+            if let Some(call) = &mut call {
+                // The command arguments start at the first non-whitespace character
+                // after the command name, and continue until the end of the line.
+                if let Some(argument) = call.arguments.last_mut() {
+                    if c.is_whitespace() {
+                        if (*argument).is_empty() {
+                            argument.start = next_ix;
+                            argument.end = next_ix;
+                        } else {
+                            argument.end = ix;
+                            call.arguments.push(next_ix..next_ix);
+                        }
+                    } else {
+                        argument.end = next_ix;
+                    }
+                }
+                // The command name ends at the first whitespace character.
+                else if !call.name.is_empty() {
+                    if c.is_whitespace() {
+                        call.arguments = vec![next_ix..next_ix];
+                    } else {
+                        call.name.end = next_ix;
+                    }
+                }
+                // The command name must begin with a letter.
+                else if c.is_alphabetic() {
+                    call.name.end = next_ix;
+                } else {
+                    return None;
+                }
+            }
+            // Commands start with a slash.
+            else if c == '/' {
+                call = Some(SlashCommandLine {
+                    name: next_ix..next_ix,
+                    arguments: Vec::new(),
+                });
+            }
+            // The line can't contain anything before the slash except for whitespace.
+            else if !c.is_whitespace() {
+                return None;
+            }
+            ix = next_ix;
+        }
+        call
     }
 }
 
@@ -296,7 +368,7 @@ mod tests {
                         text: "Hello, world!".into(),
                         run_commands_in_text: false
                     }),
-                    SlashCommandEvent::EndSection { metadata: None }
+                    SlashCommandEvent::EndSection
                 ]
             );
 
@@ -348,7 +420,7 @@ mod tests {
                         text: "Apple\n".into(),
                         run_commands_in_text: false
                     }),
-                    SlashCommandEvent::EndSection { metadata: None },
+                    SlashCommandEvent::EndSection,
                     SlashCommandEvent::Content(SlashCommandContent::Text {
                         text: "Cucumber\n".into(),
                         run_commands_in_text: false
@@ -362,7 +434,7 @@ mod tests {
                         text: "Banana\n".into(),
                         run_commands_in_text: false
                     }),
-                    SlashCommandEvent::EndSection { metadata: None }
+                    SlashCommandEvent::EndSection
                 ]
             );
 
@@ -426,9 +498,7 @@ mod tests {
                         text: "Line 1".into(),
                         run_commands_in_text: false
                     }),
-                    SlashCommandEvent::EndSection {
-                        metadata: Some(json!({ "a": true }))
-                    },
+                    SlashCommandEvent::EndSection,
                     SlashCommandEvent::Content(SlashCommandContent::Text {
                         text: "\n".into(),
                         run_commands_in_text: false
@@ -442,9 +512,7 @@ mod tests {
                         text: "Line 2".into(),
                         run_commands_in_text: false
                     }),
-                    SlashCommandEvent::EndSection {
-                        metadata: Some(json!({ "b": true }))
-                    },
+                    SlashCommandEvent::EndSection,
                     SlashCommandEvent::Content(SlashCommandContent::Text {
                         text: "\n".into(),
                         run_commands_in_text: false
@@ -458,9 +526,7 @@ mod tests {
                         text: "Line 3".into(),
                         run_commands_in_text: false
                     }),
-                    SlashCommandEvent::EndSection {
-                        metadata: Some(json!({ "c": true }))
-                    },
+                    SlashCommandEvent::EndSection,
                     SlashCommandEvent::Content(SlashCommandContent::Text {
                         text: "\n".into(),
                         run_commands_in_text: false
@@ -474,9 +540,7 @@ mod tests {
                         text: "Line 4".into(),
                         run_commands_in_text: false
                     }),
-                    SlashCommandEvent::EndSection {
-                        metadata: Some(json!({ "d": true }))
-                    },
+                    SlashCommandEvent::EndSection,
                     SlashCommandEvent::Content(SlashCommandContent::Text {
                         text: "\n".into(),
                         run_commands_in_text: false

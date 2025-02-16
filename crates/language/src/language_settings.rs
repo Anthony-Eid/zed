@@ -5,11 +5,11 @@ use anyhow::Result;
 use collections::{HashMap, HashSet};
 use core::slice;
 use ec4rs::{
-    property::{FinalNewline, IndentSize, IndentStyle, MaxLineLen, TabWidth, TrimTrailingWs},
+    property::{FinalNewline, IndentSize, IndentStyle, TabWidth, TrimTrailingWs},
     Properties as EditorconfigProperties,
 };
 use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
-use gpui::AppContext;
+use gpui::App;
 use itertools::{Either, Itertools};
 use schemars::{
     schema::{InstanceType, ObjectValidation, Schema, SchemaObject, SingleOrVec},
@@ -27,7 +27,7 @@ use std::{borrow::Cow, num::NonZeroU32, path::Path, sync::Arc};
 use util::serde::default_true;
 
 /// Initializes the language settings.
-pub fn init(cx: &mut AppContext) {
+pub fn init(cx: &mut App) {
     AllLanguageSettings::register(cx);
 }
 
@@ -35,7 +35,7 @@ pub fn init(cx: &mut AppContext) {
 pub fn language_settings<'a>(
     language: Option<LanguageName>,
     file: Option<&'a Arc<dyn File>>,
-    cx: &'a AppContext,
+    cx: &'a App,
 ) -> Cow<'a, LanguageSettings> {
     let location = file.map(|f| SettingsLocation {
         worktree_id: f.worktree_id(cx),
@@ -47,7 +47,7 @@ pub fn language_settings<'a>(
 /// Returns the settings for all languages from the provided file.
 pub fn all_language_settings<'a>(
     file: Option<&'a Arc<dyn File>>,
-    cx: &'a AppContext,
+    cx: &'a App,
 ) -> &'a AllLanguageSettings {
     let location = file.map(|f| SettingsLocation {
         worktree_id: f.worktree_id(cx),
@@ -59,8 +59,8 @@ pub fn all_language_settings<'a>(
 /// The settings for all languages.
 #[derive(Debug, Clone)]
 pub struct AllLanguageSettings {
-    /// The inline completion settings.
-    pub inline_completions: InlineCompletionSettings,
+    /// The edit prediction settings.
+    pub edit_predictions: EditPredictionSettings,
     defaults: LanguageSettings,
     languages: HashMap<LanguageName, LanguageSettings>,
     pub(crate) file_types: HashMap<Arc<str>, GlobSet>,
@@ -109,9 +109,12 @@ pub struct LanguageSettings {
     /// - `"!<language_server_id>"` - A language server ID prefixed with a `!` will be disabled.
     /// - `"..."` - A placeholder to refer to the **rest** of the registered language servers for this language.
     pub language_servers: Vec<String>,
-    /// Controls whether inline completions are shown immediately (true)
-    /// or manually by triggering `editor::ShowInlineCompletion` (false).
-    pub show_inline_completions: bool,
+    /// Controls whether edit predictions are shown immediately (true)
+    /// or manually by triggering `editor::ShowEditPrediction` (false).
+    pub show_edit_predictions: bool,
+    /// Controls whether edit predictions are shown in the given language
+    /// scopes.
+    pub edit_predictions_disabled_in: Vec<String>,
     /// Whether to show tabs and spaces in the editor.
     pub show_whitespaces: ShowWhitespaceSetting,
     /// Whether to start a new line with a comment when a previous line is a comment as well.
@@ -125,6 +128,8 @@ pub struct LanguageSettings {
     /// Whether to use additional LSP queries to format (and amend) the code after
     /// every "trigger" symbol input, defined by LSP server capabilities.
     pub use_on_type_format: bool,
+    /// Whether indentation of pasted content should be adjusted based on the context.
+    pub auto_indent_on_paste: bool,
     // Controls how the editor handles the autoclosed characters.
     pub always_treat_brackets_as_autoclosed: bool,
     /// Which code actions to run on save
@@ -133,6 +138,12 @@ pub struct LanguageSettings {
     pub linked_edits: bool,
     /// Task configuration for this language.
     pub tasks: LanguageTaskConfig,
+    /// Whether to pop the completions menu while typing in an editor without
+    /// explicitly requesting it.
+    pub show_completions_on_input: bool,
+    /// Whether to display inline and alongside documentation for items in the
+    /// completions menu.
+    pub show_completion_documentation: bool,
 }
 
 impl LanguageSettings {
@@ -184,24 +195,51 @@ impl LanguageSettings {
     }
 }
 
-/// The provider that supplies inline completions.
+/// The provider that supplies edit predictions.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum InlineCompletionProvider {
+pub enum EditPredictionProvider {
     None,
     #[default]
     Copilot,
     Supermaven,
+    Zed,
 }
 
-/// The settings for inline completions, such as [GitHub Copilot](https://github.com/features/copilot)
+impl EditPredictionProvider {
+    pub fn is_zed(&self) -> bool {
+        match self {
+            EditPredictionProvider::Zed => true,
+            EditPredictionProvider::None
+            | EditPredictionProvider::Copilot
+            | EditPredictionProvider::Supermaven => false,
+        }
+    }
+}
+
+/// The settings for edit predictions, such as [GitHub Copilot](https://github.com/features/copilot)
 /// or [Supermaven](https://supermaven.com).
 #[derive(Clone, Debug, Default)]
-pub struct InlineCompletionSettings {
-    /// The provider that supplies inline completions.
-    pub provider: InlineCompletionProvider,
-    /// A list of globs representing files that inline completions should be disabled for.
+pub struct EditPredictionSettings {
+    /// The provider that supplies edit predictions.
+    pub provider: EditPredictionProvider,
+    /// A list of globs representing files that edit predictions should be disabled for.
+    /// This list adds to a pre-existing, sensible default set of globs.
+    /// Any additional ones you add are combined with them.
     pub disabled_globs: Vec<GlobMatcher>,
+    /// When to show edit predictions previews in buffer.
+    pub inline_preview: InlineCompletionPreviewMode,
+}
+
+/// The mode in which edit predictions should be displayed.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InlineCompletionPreviewMode {
+    /// Display inline when there are no language server completions available.
+    #[default]
+    Auto,
+    /// Display inline when holding modifier key (alt by default).
+    WhenHoldingModifier,
 }
 
 /// The settings for all languages.
@@ -210,9 +248,9 @@ pub struct AllLanguageSettingsContent {
     /// The settings for enabling/disabling features.
     #[serde(default)]
     pub features: Option<FeaturesContent>,
-    /// The inline completion settings.
+    /// The edit prediction settings.
     #[serde(default)]
-    pub inline_completions: Option<InlineCompletionSettingsContent>,
+    pub edit_predictions: Option<InlineCompletionSettingsContent>,
     /// The default language settings.
     #[serde(flatten)]
     pub defaults: LanguageSettingsContent,
@@ -310,12 +348,20 @@ pub struct LanguageSettingsContent {
     /// Default: ["..."]
     #[serde(default)]
     pub language_servers: Option<Vec<String>>,
-    /// Controls whether inline completions are shown immediately (true)
-    /// or manually by triggering `editor::ShowInlineCompletion` (false).
+    /// Controls whether edit predictions are shown immediately (true)
+    /// or manually by triggering `editor::ShowEditPrediction` (false).
     ///
     /// Default: true
     #[serde(default)]
-    pub show_inline_completions: Option<bool>,
+    pub show_edit_predictions: Option<bool>,
+    /// Controls whether edit predictions are shown in the given language
+    /// scopes.
+    ///
+    /// Example: ["string", "comment"]
+    ///
+    /// Default: []
+    #[serde(default)]
+    pub edit_predictions_disabled_in: Option<Vec<String>>,
     /// Whether to show tabs and spaces in the editor.
     #[serde(default)]
     pub show_whitespaces: Option<ShowWhitespaceSetting>,
@@ -360,18 +406,37 @@ pub struct LanguageSettingsContent {
     ///
     /// Default: true
     pub linked_edits: Option<bool>,
+    /// Whether indentation of pasted content should be adjusted based on the context.
+    ///
+    /// Default: true
+    pub auto_indent_on_paste: Option<bool>,
     /// Task configuration for this language.
     ///
     /// Default: {}
     pub tasks: Option<LanguageTaskConfig>,
+    /// Whether to pop the completions menu while typing in an editor without
+    /// explicitly requesting it.
+    ///
+    /// Default: true
+    pub show_completions_on_input: Option<bool>,
+    /// Whether to display inline and alongside documentation for items in the
+    /// completions menu.
+    ///
+    /// Default: true
+    pub show_completion_documentation: Option<bool>,
 }
 
-/// The contents of the inline completion settings.
+/// The contents of the edit prediction settings.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct InlineCompletionSettingsContent {
-    /// A list of globs representing files that inline completions should be disabled for.
+    /// A list of globs representing files that edit predictions should be disabled for.
+    /// This list adds to a pre-existing, sensible default set of globs.
+    /// Any additional ones you add are combined with them.
     #[serde(default)]
     pub disabled_globs: Option<Vec<String>>,
+    /// When to show edit predictions previews in buffer.
+    #[serde(default)]
+    pub inline_preview: InlineCompletionPreviewMode,
 }
 
 /// The settings for enabling/disabling features.
@@ -380,8 +445,8 @@ pub struct InlineCompletionSettingsContent {
 pub struct FeaturesContent {
     /// Whether the GitHub Copilot feature is enabled.
     pub copilot: Option<bool>,
-    /// Determines which inline completion provider to use.
-    pub inline_completion_provider: Option<InlineCompletionProvider>,
+    /// Determines which edit prediction provider to use.
+    pub edit_prediction_provider: Option<EditPredictionProvider>,
 }
 
 /// Controls the soft-wrapping behavior in the editor.
@@ -823,7 +888,7 @@ impl AllLanguageSettings {
         &'a self,
         location: Option<SettingsLocation<'a>>,
         language_name: Option<&LanguageName>,
-        cx: &'a AppContext,
+        cx: &'a App,
     ) -> Cow<'a, LanguageSettings> {
         let settings = language_name
             .and_then(|name| self.languages.get(name))
@@ -842,38 +907,28 @@ impl AllLanguageSettings {
         }
     }
 
-    /// Returns whether inline completions are enabled for the given path.
+    /// Returns whether edit predictions are enabled for the given path.
     pub fn inline_completions_enabled_for_path(&self, path: &Path) -> bool {
         !self
-            .inline_completions
+            .edit_predictions
             .disabled_globs
             .iter()
             .any(|glob| glob.is_match(path))
     }
 
-    /// Returns whether inline completions are enabled for the given language and path.
-    pub fn inline_completions_enabled(
-        &self,
-        language: Option<&Arc<Language>>,
-        path: Option<&Path>,
-        cx: &AppContext,
-    ) -> bool {
-        if let Some(path) = path {
-            if !self.inline_completions_enabled_for_path(path) {
-                return false;
-            }
-        }
-
+    /// Returns whether edit predictions are enabled for the given language and path.
+    pub fn show_inline_completions(&self, language: Option<&Arc<Language>>, cx: &App) -> bool {
         self.language(None, language.map(|l| l.name()).as_ref(), cx)
-            .show_inline_completions
+            .show_edit_predictions
+    }
+
+    /// Returns the edit predictions preview mode for the given language and path.
+    pub fn inline_completions_preview_mode(&self) -> InlineCompletionPreviewMode {
+        self.edit_predictions.inline_preview
     }
 }
 
 fn merge_with_editorconfig(settings: &mut LanguageSettings, cfg: &EditorconfigProperties) {
-    let max_line_length = cfg.get::<MaxLineLen>().ok().and_then(|v| match v {
-        MaxLineLen::Value(u) => Some(u as u32),
-        MaxLineLen::Off => None,
-    });
     let tab_size = cfg.get::<IndentSize>().ok().and_then(|v| match v {
         IndentSize::Value(u) => NonZeroU32::new(u as u32),
         IndentSize::UseTabWidth => cfg.get::<TabWidth>().ok().and_then(|w| match w {
@@ -896,13 +951,6 @@ fn merge_with_editorconfig(settings: &mut LanguageSettings, cfg: &EditorconfigPr
             TrimTrailingWs::Value(b) => b,
         })
         .ok();
-    let preferred_line_length = max_line_length;
-    let soft_wrap = if max_line_length.is_some() {
-        Some(SoftWrap::PreferredLineLength)
-    } else {
-        None
-    };
-
     fn merge<T>(target: &mut T, value: Option<T>) {
         if let Some(value) = value {
             *target = value;
@@ -918,8 +966,6 @@ fn merge_with_editorconfig(settings: &mut LanguageSettings, cfg: &EditorconfigPr
         &mut settings.ensure_final_newline_on_save,
         ensure_final_newline_on_save,
     );
-    merge(&mut settings.preferred_line_length, preferred_line_length);
-    merge(&mut settings.soft_wrap, soft_wrap);
 }
 
 /// The kind of an inlay hint.
@@ -958,7 +1004,7 @@ impl settings::Settings for AllLanguageSettings {
 
     type FileContent = AllLanguageSettingsContent;
 
-    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
         let default_value = sources.default;
 
         // A default is provided for all settings.
@@ -973,14 +1019,21 @@ impl settings::Settings for AllLanguageSettings {
         }
 
         let mut copilot_enabled = default_value.features.as_ref().and_then(|f| f.copilot);
-        let mut inline_completion_provider = default_value
+        let mut edit_prediction_provider = default_value
             .features
             .as_ref()
-            .and_then(|f| f.inline_completion_provider);
-        let mut completion_globs = default_value
-            .inline_completions
+            .and_then(|f| f.edit_prediction_provider);
+        let mut inline_completions_preview = default_value
+            .edit_predictions
+            .as_ref()
+            .map(|inline_completions| inline_completions.inline_preview)
+            .ok_or_else(Self::missing_default)?;
+
+        let mut completion_globs: HashSet<&String> = default_value
+            .edit_predictions
             .as_ref()
             .and_then(|c| c.disabled_globs.as_ref())
+            .map(|globs| globs.iter().collect())
             .ok_or_else(Self::missing_default)?;
 
         let mut file_types: HashMap<Arc<str>, GlobSet> = HashMap::default();
@@ -1002,16 +1055,17 @@ impl settings::Settings for AllLanguageSettings {
             if let Some(provider) = user_settings
                 .features
                 .as_ref()
-                .and_then(|f| f.inline_completion_provider)
+                .and_then(|f| f.edit_prediction_provider)
             {
-                inline_completion_provider = Some(provider);
+                edit_prediction_provider = Some(provider);
             }
-            if let Some(globs) = user_settings
-                .inline_completions
-                .as_ref()
-                .and_then(|f| f.disabled_globs.as_ref())
-            {
-                completion_globs = globs;
+
+            if let Some(inline_completions) = user_settings.edit_predictions.as_ref() {
+                inline_completions_preview = inline_completions.inline_preview;
+
+                if let Some(disabled_globs) = inline_completions.disabled_globs.as_ref() {
+                    completion_globs.extend(disabled_globs.iter());
+                }
             }
 
             // A user's global settings override the default global settings and
@@ -1052,18 +1106,19 @@ impl settings::Settings for AllLanguageSettings {
         }
 
         Ok(Self {
-            inline_completions: InlineCompletionSettings {
-                provider: if let Some(provider) = inline_completion_provider {
+            edit_predictions: EditPredictionSettings {
+                provider: if let Some(provider) = edit_prediction_provider {
                     provider
                 } else if copilot_enabled.unwrap_or(true) {
-                    InlineCompletionProvider::Copilot
+                    EditPredictionProvider::Copilot
                 } else {
-                    InlineCompletionProvider::None
+                    EditPredictionProvider::None
                 },
                 disabled_globs: completion_globs
                     .iter()
                     .filter_map(|g| Some(globset::Glob::new(g).ok()?.compile_matcher()))
                     .collect(),
+                inline_preview: inline_completions_preview,
             },
             defaults,
             languages,
@@ -1074,7 +1129,7 @@ impl settings::Settings for AllLanguageSettings {
     fn json_schema(
         generator: &mut schemars::gen::SchemaGenerator,
         params: &settings::SettingsJsonSchemaParams,
-        _: &AppContext,
+        _: &App,
     ) -> schemars::schema::RootSchema {
         let mut root_schema = generator.root_schema_for::<Self::FileContent>();
 
@@ -1132,6 +1187,7 @@ fn merge_settings(settings: &mut LanguageSettings, src: &LanguageSettingsContent
     merge(&mut settings.use_autoclose, src.use_autoclose);
     merge(&mut settings.use_auto_surround, src.use_auto_surround);
     merge(&mut settings.use_on_type_format, src.use_on_type_format);
+    merge(&mut settings.auto_indent_on_paste, src.auto_indent_on_paste);
     merge(
         &mut settings.always_treat_brackets_as_autoclosed,
         src.always_treat_brackets_as_autoclosed,
@@ -1167,8 +1223,12 @@ fn merge_settings(settings: &mut LanguageSettings, src: &LanguageSettingsContent
     );
     merge(&mut settings.language_servers, src.language_servers.clone());
     merge(
-        &mut settings.show_inline_completions,
-        src.show_inline_completions,
+        &mut settings.show_edit_predictions,
+        src.show_edit_predictions,
+    );
+    merge(
+        &mut settings.edit_predictions_disabled_in,
+        src.edit_predictions_disabled_in.clone(),
     );
     merge(&mut settings.show_whitespaces, src.show_whitespaces);
     merge(
@@ -1176,6 +1236,14 @@ fn merge_settings(settings: &mut LanguageSettings, src: &LanguageSettingsContent
         src.extend_comment_on_newline,
     );
     merge(&mut settings.inlay_hints, src.inlay_hints);
+    merge(
+        &mut settings.show_completions_on_input,
+        src.show_completions_on_input,
+    );
+    merge(
+        &mut settings.show_completion_documentation,
+        src.show_completion_documentation,
+    );
 }
 
 /// Allows to enable/disable formatting with Prettier

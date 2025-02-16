@@ -2,8 +2,8 @@
 name = "evals"
 description = "Evaluations for Zed's AI features"
 version = "0.1.0"
-edition = "2021"
-publish = false
+edition.workspace = true
+publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [lints]
@@ -30,9 +30,10 @@ languages.workspace = true
 node_runtime.workspace = true
 open_ai.workspace = true
 project.workspace = true
+reqwest_client.workspace = true
 semantic_index.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 smol.workspace = true
-reqwest_client.workspace = true
+util.workspace = true

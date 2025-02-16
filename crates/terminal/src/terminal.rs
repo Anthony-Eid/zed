@@ -58,9 +58,9 @@ use std::{
 use thiserror::Error;
 
 use gpui::{
-    actions, black, px, AnyWindowHandle, AppContext, Bounds, ClipboardItem, EventEmitter, Hsla,
-    Keystroke, ModelContext, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, Rgba, ScrollWheelEvent, SharedString, Size, Task, TouchPhase,
+    actions, black, px, AnyWindowHandle, App, Bounds, ClipboardItem, Context, EventEmitter, Hsla,
+    Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    Rgba, ScrollWheelEvent, SharedString, Size, Task, TouchPhase,
 };
 
 use crate::mappings::{colors::to_alac_rgb, keys::to_esc_str};
@@ -122,7 +122,7 @@ pub struct PathLikeTarget {
 /// A string inside terminal, potentially useful as a URI that can be opened.
 #[derive(Clone, Debug)]
 pub enum MaybeNavigationTarget {
-    /// HTTP, git, etc. string determined by the [`URL_REGEX`] regex.
+    /// HTTP, git, etc. string determined by the `URL_REGEX` regex.
     Url(String),
     /// File system path, absolute or relative, existing or not.
     /// Might have line and column number(s) attached as `file.rs:1:23`
@@ -156,7 +156,7 @@ impl EventListener for ZedListener {
     }
 }
 
-pub fn init(cx: &mut AppContext) {
+pub fn init(cx: &mut App) {
     TerminalSettings::register(cx);
 }
 
@@ -324,6 +324,7 @@ impl TerminalBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         working_directory: Option<PathBuf>,
+        python_venv_directory: Option<PathBuf>,
         task: Option<TaskState>,
         shell: Shell,
         mut env: HashMap<String, String>,
@@ -333,7 +334,7 @@ impl TerminalBuilder {
         is_ssh_terminal: bool,
         window: AnyWindowHandle,
         completion_tx: Sender<()>,
-        cx: &AppContext,
+        cx: &App,
     ) -> Result<TerminalBuilder> {
         // If the parent environment doesn't have a locale set
         // (As is the case when launched from a .app on MacOS),
@@ -346,6 +347,7 @@ impl TerminalBuilder {
 
         env.insert("ZED_TERM".to_string(), "true".to_string());
         env.insert("TERM_PROGRAM".to_string(), "zed".to_string());
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert(
             "TERM_PROGRAM_VERSION".to_string(),
             release_channel::AppVersion::global(cx).to_string(),
@@ -374,7 +376,7 @@ impl TerminalBuilder {
                 working_directory: working_directory
                     .clone()
                     .or_else(|| Some(home_dir().to_path_buf())),
-                hold: false,
+                drain_on_exit: true,
                 env: env.into_iter().collect(),
             }
         };
@@ -399,7 +401,7 @@ impl TerminalBuilder {
             ..Config::default()
         };
 
-        //Spawn a task so the Alacritty EventLoop can communicate with us in a view context
+        //Spawn a task so the Alacritty EventLoop can communicate with us
         //TODO: Remove with a bounded sender which can be dispatched on &self
         let (events_tx, events_rx) = unbounded();
         //Set up the terminal...
@@ -439,7 +441,7 @@ impl TerminalBuilder {
             term.clone(),
             ZedListener(events_tx.clone()),
             pty,
-            pty_options.hold,
+            pty_options.drain_on_exit,
             false,
         )?;
 
@@ -471,6 +473,7 @@ impl TerminalBuilder {
             word_regex: RegexSearch::new(WORD_REGEX).unwrap(),
             vi_mode_enabled: false,
             is_ssh_terminal,
+            python_venv_directory,
         };
 
         Ok(TerminalBuilder {
@@ -479,7 +482,7 @@ impl TerminalBuilder {
         })
     }
 
-    pub fn subscribe(mut self, cx: &ModelContext<Terminal>) -> Terminal {
+    pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
         //Event loop
         cx.spawn(|terminal, mut cx| async move {
             while let Some(event) = self.events_rx.next().await {
@@ -619,6 +622,7 @@ pub struct Terminal {
     pub breadcrumb_text: String,
     pub pty_info: PtyProcessInfo,
     title_override: Option<SharedString>,
+    pub python_venv_directory: Option<PathBuf>,
     scroll_px: Pixels,
     next_link_id: usize,
     selection_phase: SelectionPhase,
@@ -639,6 +643,8 @@ pub struct TaskState {
     pub status: TaskStatus,
     pub completion_rx: Receiver<()>,
     pub hide: HideStrategy,
+    pub show_summary: bool,
+    pub show_command: bool,
 }
 
 /// A status of the current terminal tab's task.
@@ -668,7 +674,7 @@ impl TaskStatus {
 }
 
 impl Terminal {
-    fn process_event(&mut self, event: &AlacTermEvent, cx: &mut ModelContext<Self>) {
+    fn process_event(&mut self, event: &AlacTermEvent, cx: &mut Context<Self>) {
         match event {
             AlacTermEvent::Title(title) => {
                 self.breadcrumb_text = title.to_string();
@@ -737,12 +743,11 @@ impl Terminal {
         self.selection_phase == SelectionPhase::Selecting
     }
 
-    ///Takes events from Alacritty and translates them to behavior on this view
     fn process_terminal_event(
         &mut self,
         event: &InternalEvent,
         term: &mut Term<ZedListener>,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         match event {
             InternalEvent::Resize(mut new_size) => {
@@ -818,7 +823,7 @@ impl Terminal {
                         selection.update(point, AlacDirection::Right);
                         term.selection = Some(selection);
 
-                        #[cfg(target_os = "linux")]
+                        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                         if let Some(selection_text) = term.selection_to_string() {
                             cx.write_to_primary(ClipboardItem::new_string(selection_text));
                         }
@@ -831,7 +836,7 @@ impl Terminal {
             InternalEvent::SetSelection(selection) => {
                 term.selection = selection.as_ref().map(|(sel, _)| sel.clone());
 
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                 if let Some(selection_text) = term.selection_to_string() {
                     cx.write_to_primary(ClipboardItem::new_string(selection_text));
                 }
@@ -852,7 +857,7 @@ impl Terminal {
                     selection.update(point, side);
                     term.selection = Some(selection);
 
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                     if let Some(selection_text) = term.selection_to_string() {
                         cx.write_to_primary(ClipboardItem::new_string(selection_text));
                     }
@@ -925,7 +930,7 @@ impl Terminal {
                     let file_path = term.bounds_to_string(*word_match.start(), *word_match.end());
 
                     let (sanitized_match, sanitized_word) =
-                        if file_path.starts_with('[') && file_path.ends_with(']') {
+                        if is_path_surrounded_by_common_symbols(&file_path) {
                             (
                                 Match::new(
                                     word_match.start().add(term, Boundary::Cursor, 1),
@@ -944,22 +949,32 @@ impl Terminal {
 
                 match found_word {
                     Some((maybe_url_or_path, is_url, url_match)) => {
-                        if *open {
-                            let target = if is_url {
-                                MaybeNavigationTarget::Url(maybe_url_or_path)
-                            } else {
+                        let target = if is_url {
+                            // Treat "file://" URLs like file paths to ensure
+                            // that line numbers at the end of the path are
+                            // handled correctly
+                            if let Some(path) = maybe_url_or_path.strip_prefix("file://") {
                                 MaybeNavigationTarget::PathLike(PathLikeTarget {
-                                    maybe_path: maybe_url_or_path,
+                                    maybe_path: path.to_string(),
                                     terminal_dir: self.working_directory(),
                                 })
-                            };
+                            } else {
+                                MaybeNavigationTarget::Url(maybe_url_or_path.clone())
+                            }
+                        } else {
+                            MaybeNavigationTarget::PathLike(PathLikeTarget {
+                                maybe_path: maybe_url_or_path.clone(),
+                                terminal_dir: self.working_directory(),
+                            })
+                        };
+                        if *open {
                             cx.emit(Event::Open(target));
                         } else {
                             self.update_selected_word(
                                 prev_hovered_word,
                                 url_match,
                                 maybe_url_or_path,
-                                is_url,
+                                target,
                                 cx,
                             );
                         }
@@ -981,8 +996,8 @@ impl Terminal {
         prev_word: Option<HoveredWord>,
         word_match: RangeInclusive<AlacPoint>,
         word: String,
-        is_url: bool,
-        cx: &mut ModelContext<Self>,
+        navigation_target: MaybeNavigationTarget,
+        cx: &mut Context<Self>,
     ) {
         if let Some(prev_word) = prev_word {
             if prev_word.word == word && prev_word.word_match == word_match {
@@ -1000,14 +1015,6 @@ impl Terminal {
             word_match,
             id: self.next_link_id(),
         });
-        let navigation_target = if is_url {
-            MaybeNavigationTarget::Url(word)
-        } else {
-            MaybeNavigationTarget::PathLike(PathLikeTarget {
-                maybe_path: word,
-                terminal_dir: self.working_directory(),
-            })
-        };
         cx.emit(Event::NewNavigationTarget(Some(navigation_target)));
     }
 
@@ -1174,10 +1181,10 @@ impl Terminal {
         }
 
         let motion: Option<ViMotion> = match key.as_str() {
-            "h" => Some(ViMotion::Left),
-            "j" => Some(ViMotion::Down),
-            "k" => Some(ViMotion::Up),
-            "l" => Some(ViMotion::Right),
+            "h" | "left" => Some(ViMotion::Left),
+            "j" | "down" => Some(ViMotion::Down),
+            "k" | "up" => Some(ViMotion::Up),
+            "l" | "right" => Some(ViMotion::Right),
             "w" => Some(ViMotion::WordRight),
             "b" if !keystroke.modifiers.control => Some(ViMotion::WordLeft),
             "e" => Some(ViMotion::WordRightEnd),
@@ -1291,7 +1298,7 @@ impl Terminal {
         self.input(paste_text);
     }
 
-    pub fn sync(&mut self, cx: &mut ModelContext<Self>) {
+    pub fn sync(&mut self, cx: &mut Context<Self>) {
         let term = self.term.clone();
         let mut terminal = term.lock_unfair();
         //Note that the ordering of events matters for event processing
@@ -1452,7 +1459,7 @@ impl Terminal {
     fn drag_line_delta(&self, e: &MouseMoveEvent, region: Bounds<Pixels>) -> Option<Pixels> {
         //TODO: Why do these need to be doubled? Probably the same problem that the IME has
         let top = region.origin.y + (self.last_content.size.line_height * 2.);
-        let bottom = region.lower_left().y - (self.last_content.size.line_height * 2.);
+        let bottom = region.bottom_left().y - (self.last_content.size.line_height * 2.);
         let scroll_delta = if e.position.y < top {
             (top - e.position.y).pow(1.1)
         } else if e.position.y > bottom {
@@ -1467,7 +1474,7 @@ impl Terminal {
         &mut self,
         e: &MouseDownEvent,
         origin: Point<Pixels>,
-        _cx: &mut ModelContext<Self>,
+        _cx: &mut Context<Self>,
     ) {
         let position = e.position - origin;
         let point = grid_point(
@@ -1508,7 +1515,7 @@ impl Terminal {
                             .push_back(InternalEvent::SetSelection(Some((sel, point))));
                     }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                 MouseButton::Middle => {
                     if let Some(item) = _cx.read_from_primary() {
                         let text = item.text().unwrap_or_default().to_string();
@@ -1520,7 +1527,7 @@ impl Terminal {
         }
     }
 
-    pub fn mouse_up(&mut self, e: &MouseUpEvent, origin: Point<Pixels>, cx: &ModelContext<Self>) {
+    pub fn mouse_up(&mut self, e: &MouseUpEvent, origin: Point<Pixels>, cx: &Context<Self>) {
         let setting = TerminalSettings::get_global(cx);
 
         let position = e.position - origin;
@@ -1624,7 +1631,7 @@ impl Terminal {
     pub fn find_matches(
         &self,
         mut searcher: RegexSearch,
-        cx: &ModelContext<Self>,
+        cx: &Context<Self>,
     ) -> Task<Vec<RangeInclusive<AlacPoint>>> {
         let term = self.term.clone();
         cx.background_executor().spawn(async move {
@@ -1716,23 +1723,19 @@ impl Terminal {
         self.task.as_ref()
     }
 
-    pub fn wait_for_completed_task(&self, cx: &AppContext) -> Task<()> {
+    pub fn wait_for_completed_task(&self, cx: &App) -> Task<()> {
         if let Some(task) = self.task() {
             if task.status == TaskStatus::Running {
-                let mut completion_receiver = task.completion_rx.clone();
+                let completion_receiver = task.completion_rx.clone();
                 return cx.spawn(|_| async move {
-                    completion_receiver.next().await;
+                    let _ = completion_receiver.recv().await;
                 });
             }
         }
         Task::ready(())
     }
 
-    fn register_task_finished(
-        &mut self,
-        error_code: Option<i32>,
-        cx: &mut ModelContext<'_, Terminal>,
-    ) {
+    fn register_task_finished(&mut self, error_code: Option<i32>, cx: &mut Context<'_, Terminal>) {
         self.completion_tx.try_send(()).ok();
         let task = match &mut self.task {
             Some(task) => task,
@@ -1756,11 +1759,22 @@ impl Terminal {
         };
 
         let (finished_successfully, task_line, command_line) = task_summary(task, error_code);
-        // SAFETY: the invocation happens on non `TaskStatus::Running` tasks, once,
-        // after either `AlacTermEvent::Exit` or `AlacTermEvent::ChildExit` events that are spawned
-        // when Zed task finishes and no more output is made.
-        // After the task summary is output once, no more text is appended to the terminal.
-        unsafe { append_text_to_term(&mut self.term.lock(), &[&task_line, &command_line]) };
+        let mut lines_to_show = Vec::new();
+        if task.show_summary {
+            lines_to_show.push(task_line.as_str());
+        }
+        if task.show_command {
+            lines_to_show.push(command_line.as_str());
+        }
+
+        if !lines_to_show.is_empty() {
+            // SAFETY: the invocation happens on non `TaskStatus::Running` tasks, once,
+            // after either `AlacTermEvent::Exit` or `AlacTermEvent::ChildExit` events that are spawned
+            // when Zed task finishes and no more output is made.
+            // After the task summary is output once, no more text is appended to the terminal.
+            unsafe { append_text_to_term(&mut self.term.lock(), &lines_to_show) };
+        }
+
         match task.hide {
             HideStrategy::Never => {}
             HideStrategy::Always => {
@@ -1773,6 +1787,14 @@ impl Terminal {
             }
         }
     }
+}
+
+fn is_path_surrounded_by_common_symbols(path: &str) -> bool {
+    // Avoid detecting `[]` or `()` strings as paths, surrounded by common symbols
+    path.len() > 2
+        // The rest of the brackets and various quotes cannot be matched by the [`WORD_REGEX`] hence not checked for.
+        && (path.starts_with('[') && path.ends_with(']')
+            || path.starts_with('(') && path.ends_with(')'))
 }
 
 const TASK_DELIMITER: &str = "⏵ ";
@@ -1888,7 +1910,7 @@ fn content_index_for_mouse(pos: Point<Pixels>, size: &TerminalSize) -> usize {
 
 /// Converts an 8 bit ANSI color to its GPUI equivalent.
 /// Accepts `usize` for compatibility with the `alacritty::Colors` interface,
-/// Other than that use case, should only be called with values in the [0,255] range
+/// Other than that use case, should only be called with values in the `[0,255]` range
 pub fn get_color_at_index(index: usize, theme: &Theme) -> Hsla {
     let colors = theme.colors();
 

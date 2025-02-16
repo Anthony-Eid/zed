@@ -2,9 +2,9 @@
 
 use semantic_version::SemanticVersion;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Display, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EventRequestBody {
     /// Identifier unique to each system Zed is installed on
     pub system_id: Option<String>,
@@ -32,7 +32,7 @@ impl EventRequestBody {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EventWrapper {
     pub signed_in: bool,
     /// Duration between this event's timestamp and the timestamp of the first event in the current batch
@@ -47,6 +47,7 @@ pub struct EventWrapper {
 pub enum AssistantKind {
     Panel,
     Inline,
+    InlineTerminal,
 }
 impl Display for AssistantKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,6 +57,7 @@ impl Display for AssistantKind {
             match self {
                 Self::Panel => "panel",
                 Self::Inline => "inline",
+                Self::InlineTerminal => "inline_terminal",
             }
         )
     }
@@ -89,8 +91,10 @@ impl Display for AssistantPhase {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Event {
+    Flexible(FlexibleEvent),
     Editor(EditorEvent),
     InlineCompletion(InlineCompletionEvent),
+    InlineCompletionRating(InlineCompletionRatingEvent),
     Call(CallEvent),
     Assistant(AssistantEvent),
     Cpu(CpuEvent),
@@ -101,6 +105,12 @@ pub enum Event {
     Edit(EditEvent),
     Action(ActionEvent),
     Repl(ReplEvent),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FlexibleEvent {
+    pub event_type: String,
+    pub event_properties: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -129,6 +139,21 @@ pub struct InlineCompletionEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum InlineCompletionRating {
+    Positive,
+    Negative,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InlineCompletionRatingEvent {
+    pub rating: InlineCompletionRating,
+    pub input_events: Arc<str>,
+    pub input_excerpt: Arc<str>,
+    pub output_excerpt: Arc<str>,
+    pub feedback: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CallEvent {
     /// Operation performed: invite/join call; begin/end screenshare; share/unshare project; etc
     pub operation: String,
@@ -140,6 +165,8 @@ pub struct CallEvent {
 pub struct AssistantEvent {
     /// Unique random identifier for each assistant tab (None for inline assist)
     pub conversation_id: Option<String>,
+    /// Server-generated message ID (only supported for some providers)
+    pub message_id: Option<String>,
     /// The kind of assistant (Panel, Inline)
     pub kind: AssistantKind,
     #[serde(default)]
@@ -222,13 +249,13 @@ pub struct HangReport {
     pub installation_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LocationData {
     pub file: String,
     pub line: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Panic {
     /// The name of the thread that panicked
     pub thread: String,
@@ -240,8 +267,12 @@ pub struct Panic {
     pub backtrace: Vec<String>,
     /// Zed version number
     pub app_version: String,
+    /// The Git commit SHA that Zed was built at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_commit_sha: Option<String>,
     /// Zed release channel (stable, preview, dev)
     pub release_channel: String,
+    pub target: Option<String>,
     pub os_name: String,
     pub os_version: Option<String>,
     pub architecture: String,

@@ -1,5 +1,6 @@
 use std::cmp;
-use std::sync::OnceLock;
+use std::path::StripPrefixError;
+use std::sync::{Arc, OnceLock};
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
@@ -20,8 +21,8 @@ pub fn home_dir() -> &'static PathBuf {
 
 pub trait PathExt {
     fn compact(&self) -> PathBuf;
-    fn icon_stem_or_suffix(&self) -> Option<&str>;
     fn extension_or_hidden_file_name(&self) -> Option<&str>;
+    fn to_sanitized_string(&self) -> String;
     fn try_from_bytes<'a>(bytes: &'a [u8]) -> anyhow::Result<Self>
     where
         Self: From<&'a Path>,
@@ -57,7 +58,7 @@ impl<T: AsRef<Path>> PathExt for T {
     ///   does not have the user's home directory prefix, or if we are not on
     ///   Linux or macOS, the original path is returned unchanged.
     fn compact(&self) -> PathBuf {
-        if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) || cfg!(target_os = "macos") {
             match self.as_ref().strip_prefix(home_dir().as_path()) {
                 Ok(relative_path) => {
                     let mut shortened_path = PathBuf::new();
@@ -72,8 +73,8 @@ impl<T: AsRef<Path>> PathExt for T {
         }
     }
 
-    /// Returns either the suffix if available, or the file stem otherwise to determine which file icon to use
-    fn icon_stem_or_suffix(&self) -> Option<&str> {
+    /// Returns a file's extension or, if the file is hidden, its name without the leading dot
+    fn extension_or_hidden_file_name(&self) -> Option<&str> {
         let path = self.as_ref();
         let file_name = path.file_name()?.to_str()?;
         if file_name.starts_with('.') {
@@ -85,13 +86,77 @@ impl<T: AsRef<Path>> PathExt for T {
             .or_else(|| path.file_stem()?.to_str())
     }
 
-    /// Returns a file's extension or, if the file is hidden, its name without the leading dot
-    fn extension_or_hidden_file_name(&self) -> Option<&str> {
-        if let Some(extension) = self.as_ref().extension() {
-            return extension.to_str();
+    /// Returns a sanitized string representation of the path.
+    /// Note, on Windows, this assumes that the path is a valid UTF-8 string and
+    /// is not a UNC path.
+    fn to_sanitized_string(&self) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            self.as_ref().to_string_lossy().replace("/", "\\")
         }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.as_ref().to_string_lossy().to_string()
+        }
+    }
+}
 
-        self.as_ref().file_name()?.to_str()?.split('.').last()
+/// Due to the issue of UNC paths on Windows, which can cause bugs in various parts of Zed, introducing this `SanitizedPath`
+/// leverages Rust's type system to ensure that all paths entering Zed are always "sanitized" by removing the `\\\\?\\` prefix.
+/// On non-Windows operating systems, this struct is effectively a no-op.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SanitizedPath(pub Arc<Path>);
+
+impl SanitizedPath {
+    pub fn starts_with(&self, prefix: &SanitizedPath) -> bool {
+        self.0.starts_with(&prefix.0)
+    }
+
+    pub fn as_path(&self) -> &Arc<Path> {
+        &self.0
+    }
+
+    pub fn to_string(&self) -> String {
+        self.0.to_string_lossy().to_string()
+    }
+
+    pub fn to_glob_string(&self) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            self.0.to_string_lossy().replace("/", "\\")
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.0.to_string_lossy().to_string()
+        }
+    }
+
+    pub fn join(&self, path: &Self) -> Self {
+        self.0.join(&path.0).into()
+    }
+
+    pub fn strip_prefix(&self, base: &Self) -> Result<&Path, StripPrefixError> {
+        self.0.strip_prefix(base.as_path())
+    }
+}
+
+impl From<SanitizedPath> for Arc<Path> {
+    fn from(sanitized_path: SanitizedPath) -> Self {
+        sanitized_path.0
+    }
+}
+
+impl<T: AsRef<Path>> From<T> for SanitizedPath {
+    #[cfg(not(target_os = "windows"))]
+    fn from(path: T) -> Self {
+        let path = path.as_ref();
+        SanitizedPath(path.into())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn from(path: T) -> Self {
+        let path = path.as_ref();
+        SanitizedPath(dunce::simplified(path).into())
     }
 }
 
@@ -378,7 +443,15 @@ pub fn compare_paths(
                         .as_deref()
                         .map(NumericPrefixWithSuffix::from_numeric_prefixed_str);
 
-                    num_and_remainder_a.cmp(&num_and_remainder_b)
+                    num_and_remainder_a.cmp(&num_and_remainder_b).then_with(|| {
+                        if a_is_file && b_is_file {
+                            let ext_a = path_a.extension().unwrap_or_default();
+                            let ext_b = path_b.extension().unwrap_or_default();
+                            ext_a.cmp(ext_b)
+                        } else {
+                            cmp::Ordering::Equal
+                        }
+                    })
                 });
                 if !ordering.is_eq() {
                     return ordering;
@@ -429,6 +502,28 @@ mod tests {
             vec![
                 (Path::new("root1/one.txt"), true),
                 (Path::new("root1/one.two.txt"), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn compare_paths_with_same_name_different_extensions() {
+        let mut paths = vec![
+            (Path::new("test_dirs/file.rs"), true),
+            (Path::new("test_dirs/file.txt"), true),
+            (Path::new("test_dirs/file.md"), true),
+            (Path::new("test_dirs/file"), true),
+            (Path::new("test_dirs/file.a"), true),
+        ];
+        paths.sort_by(|&a, &b| compare_paths(a, b));
+        assert_eq!(
+            paths,
+            vec![
+                (Path::new("test_dirs/file"), true),
+                (Path::new("test_dirs/file.a"), true),
+                (Path::new("test_dirs/file.md"), true),
+                (Path::new("test_dirs/file.rs"), true),
+                (Path::new("test_dirs/file.txt"), true),
             ]
         );
     }
@@ -699,38 +794,11 @@ mod tests {
         ]
         .iter()
         .collect();
-        if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) || cfg!(target_os = "macos") {
             assert_eq!(path.compact().to_str(), Some("~/some_file.txt"));
         } else {
             assert_eq!(path.compact().to_str(), path.to_str());
         }
-    }
-
-    #[test]
-    fn test_icon_stem_or_suffix() {
-        // No dots in name
-        let path = Path::new("/a/b/c/file_name.rs");
-        assert_eq!(path.icon_stem_or_suffix(), Some("rs"));
-
-        // Single dot in name
-        let path = Path::new("/a/b/c/file.name.rs");
-        assert_eq!(path.icon_stem_or_suffix(), Some("rs"));
-
-        // No suffix
-        let path = Path::new("/a/b/c/file");
-        assert_eq!(path.icon_stem_or_suffix(), Some("file"));
-
-        // Multiple dots in name
-        let path = Path::new("/a/b/c/long.file.name.rs");
-        assert_eq!(path.icon_stem_or_suffix(), Some("rs"));
-
-        // Hidden file, no extension
-        let path = Path::new("/a/b/c/.gitignore");
-        assert_eq!(path.icon_stem_or_suffix(), Some("gitignore"));
-
-        // Hidden file, with extension
-        let path = Path::new("/a/b/c/.eslintrc.js");
-        assert_eq!(path.icon_stem_or_suffix(), Some("eslintrc.js"));
     }
 
     #[test]
@@ -753,7 +821,7 @@ mod tests {
 
         // Hidden file, with extension
         let path = Path::new("/a/b/c/.eslintrc.js");
-        assert_eq!(path.extension_or_hidden_file_name(), Some("js"));
+        assert_eq!(path.extension_or_hidden_file_name(), Some("eslintrc.js"));
     }
 
     #[test]
@@ -773,6 +841,24 @@ mod tests {
         assert!(
             path_matcher.is_match(path),
             "Path matcher should match {path:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_sanitized_path() {
+        let path = Path::new("C:\\Users\\someone\\test_file.rs");
+        let sanitized_path = SanitizedPath::from(path);
+        assert_eq!(
+            sanitized_path.to_string(),
+            "C:\\Users\\someone\\test_file.rs"
+        );
+
+        let path = Path::new("\\\\?\\C:\\Users\\someone\\test_file.rs");
+        let sanitized_path = SanitizedPath::from(path);
+        assert_eq!(
+            sanitized_path.to_string(),
+            "C:\\Users\\someone\\test_file.rs"
         );
     }
 }

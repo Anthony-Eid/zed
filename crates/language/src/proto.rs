@@ -79,11 +79,13 @@ pub fn serialize_operation(operation: &crate::Operation) -> proto::Operation {
             crate::Operation::UpdateCompletionTriggers {
                 triggers,
                 lamport_timestamp,
+                server_id,
             } => proto::operation::Variant::UpdateCompletionTriggers(
                 proto::operation::UpdateCompletionTriggers {
                     replica_id: lamport_timestamp.replica_id as u32,
                     lamport_timestamp: lamport_timestamp.value,
-                    triggers: triggers.clone(),
+                    triggers: triggers.iter().cloned().collect(),
+                    language_server_id: server_id.to_proto(),
                 },
             ),
         }),
@@ -211,7 +213,7 @@ pub fn serialize_diagnostics<'a>(
             group_id: entry.diagnostic.group_id as u64,
             is_primary: entry.diagnostic.is_primary,
             is_valid: true,
-            code: entry.diagnostic.code.clone(),
+            code: entry.diagnostic.code.as_ref().map(|s| s.to_string()),
             is_disk_based: entry.diagnostic.is_disk_based,
             is_unnecessary: entry.diagnostic.is_unnecessary,
             data: entry.diagnostic.data.as_ref().map(|data| data.to_string()),
@@ -326,6 +328,7 @@ pub fn deserialize_operation(message: proto::Operation) -> Result<crate::Operati
                         replica_id: message.replica_id as ReplicaId,
                         value: message.lamport_timestamp,
                     },
+                    server_id: LanguageServerId::from_proto(message.language_server_id),
                 }
             }
         },
@@ -416,7 +419,7 @@ pub fn deserialize_diagnostics(
                     },
                     message: diagnostic.message,
                     group_id: diagnostic.group_id as usize,
-                    code: diagnostic.code,
+                    code: diagnostic.code.map(lsp::NumberOrString::from_string),
                     is_primary: diagnostic.is_primary,
                     is_disk_based: diagnostic.is_disk_based,
                     is_unnecessary: diagnostic.is_unnecessary,

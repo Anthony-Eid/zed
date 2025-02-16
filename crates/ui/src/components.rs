@@ -1,6 +1,6 @@
 mod avatar;
 mod button;
-mod checkbox;
+mod content_group;
 mod context_menu;
 mod disclosure;
 mod divider;
@@ -11,9 +11,11 @@ mod image;
 mod indent_guides;
 mod indicator;
 mod keybinding;
+mod keybinding_hint;
 mod label;
 mod list;
 mod modal;
+mod navigable;
 mod numeric_stepper;
 mod popover;
 mod popover_menu;
@@ -25,7 +27,8 @@ mod settings_group;
 mod stack;
 mod tab;
 mod tab_bar;
-mod tool_strip;
+mod table;
+mod toggle;
 mod tooltip;
 
 #[cfg(feature = "stories")]
@@ -33,7 +36,7 @@ mod stories;
 
 pub use avatar::*;
 pub use button::*;
-pub use checkbox::*;
+pub use content_group::*;
 pub use context_menu::*;
 pub use disclosure::*;
 pub use divider::*;
@@ -44,9 +47,11 @@ pub use image::*;
 pub use indent_guides::*;
 pub use indicator::*;
 pub use keybinding::*;
+pub use keybinding_hint::*;
 pub use label::*;
 pub use list::*;
 pub use modal::*;
+pub use navigable::*;
 pub use numeric_stepper::*;
 pub use popover::*;
 pub use popover_menu::*;
@@ -58,7 +63,8 @@ pub use settings_group::*;
 pub use stack::*;
 pub use tab::*;
 pub use tab_bar::*;
-pub use tool_strip::*;
+pub use table::*;
+pub use toggle::*;
 pub use tooltip::*;
 
 #[cfg(feature = "stories")]

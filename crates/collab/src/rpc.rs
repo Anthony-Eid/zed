@@ -1,6 +1,6 @@
 mod connection_pool;
 
-use crate::api::CloudflareIpCountryHeader;
+use crate::api::{CloudflareIpCountryHeader, SystemIdHeader};
 use crate::llm::LlmTokenClaims;
 use crate::{
     auth,
@@ -137,6 +137,7 @@ struct Session {
     /// The GeoIP country code for the user.
     #[allow(unused)]
     geoip_country_code: Option<String>,
+    system_id: Option<String>,
     _executor: Executor,
 }
 
@@ -308,6 +309,11 @@ impl Server {
             .add_request_handler(forward_read_only_project_request::<proto::ResolveInlayHint>)
             .add_request_handler(forward_read_only_project_request::<proto::OpenBufferByPath>)
             .add_request_handler(forward_read_only_project_request::<proto::GitBranches>)
+            .add_request_handler(forward_read_only_project_request::<proto::OpenUnstagedDiff>)
+            .add_request_handler(forward_read_only_project_request::<proto::OpenUncommittedDiff>)
+            .add_request_handler(
+                forward_mutating_project_request::<proto::RegisterBufferWithLanguageServers>,
+            )
             .add_request_handler(forward_mutating_project_request::<proto::UpdateGitBranch>)
             .add_request_handler(forward_mutating_project_request::<proto::GetCompletions>)
             .add_request_handler(
@@ -328,6 +334,9 @@ impl Server {
             .add_request_handler(forward_mutating_project_request::<proto::CopyProjectEntry>)
             .add_request_handler(forward_mutating_project_request::<proto::DeleteProjectEntry>)
             .add_request_handler(forward_mutating_project_request::<proto::ExpandProjectEntry>)
+            .add_request_handler(
+                forward_mutating_project_request::<proto::ExpandAllForProjectEntry>,
+            )
             .add_request_handler(forward_mutating_project_request::<proto::OnTypeFormatting>)
             .add_request_handler(forward_mutating_project_request::<proto::SaveBuffer>)
             .add_request_handler(forward_mutating_project_request::<proto::BlameBuffer>)
@@ -340,7 +349,7 @@ impl Server {
             .add_message_handler(broadcast_project_message_from_host::<proto::UpdateBufferFile>)
             .add_message_handler(broadcast_project_message_from_host::<proto::BufferReloaded>)
             .add_message_handler(broadcast_project_message_from_host::<proto::BufferSaved>)
-            .add_message_handler(broadcast_project_message_from_host::<proto::UpdateDiffBase>)
+            .add_message_handler(broadcast_project_message_from_host::<proto::UpdateDiffBases>)
             .add_request_handler(get_users)
             .add_request_handler(fuzzy_search_users)
             .add_request_handler(request_contact)
@@ -383,6 +392,10 @@ impl Server {
             .add_request_handler(forward_mutating_project_request::<proto::OpenContext>)
             .add_request_handler(forward_mutating_project_request::<proto::CreateContext>)
             .add_request_handler(forward_mutating_project_request::<proto::SynchronizeContexts>)
+            .add_request_handler(forward_mutating_project_request::<proto::Stage>)
+            .add_request_handler(forward_mutating_project_request::<proto::Unstage>)
+            .add_request_handler(forward_mutating_project_request::<proto::Commit>)
+            .add_request_handler(forward_mutating_project_request::<proto::OpenCommitMessageBuffer>)
             .add_message_handler(broadcast_project_message_from_host::<proto::AdvertiseContexts>)
             .add_message_handler(update_context)
             .add_request_handler({
@@ -417,7 +430,7 @@ impl Server {
         let peer = self.peer.clone();
         let timeout = self.app_state.executor.sleep(CLEANUP_TIMEOUT);
         let pool = self.connection_pool.clone();
-        let live_kit_client = self.app_state.live_kit_client.clone();
+        let livekit_client = self.app_state.livekit_client.clone();
 
         let span = info_span!("start server");
         self.app_state.executor.spawn_detached(
@@ -462,8 +475,8 @@ impl Server {
                     for room_id in room_ids {
                         let mut contacts_to_update = HashSet::default();
                         let mut canceled_calls_to_user_ids = Vec::new();
-                        let mut live_kit_room = String::new();
-                        let mut delete_live_kit_room = false;
+                        let mut livekit_room = String::new();
+                        let mut delete_livekit_room = false;
 
                         if let Some(mut refreshed_room) = app_state
                             .db
@@ -486,8 +499,8 @@ impl Server {
                                 .extend(refreshed_room.canceled_calls_to_user_ids.iter().copied());
                             canceled_calls_to_user_ids =
                                 mem::take(&mut refreshed_room.canceled_calls_to_user_ids);
-                            live_kit_room = mem::take(&mut refreshed_room.room.live_kit_room);
-                            delete_live_kit_room = refreshed_room.room.participants.is_empty();
+                            livekit_room = mem::take(&mut refreshed_room.room.livekit_room);
+                            delete_livekit_room = refreshed_room.room.participants.is_empty();
                         }
 
                         {
@@ -538,9 +551,9 @@ impl Server {
                             }
                         }
 
-                        if let Some(live_kit) = live_kit_client.as_ref() {
-                            if delete_live_kit_room {
-                                live_kit.delete_room(live_kit_room).await.trace_err();
+                        if let Some(live_kit) = livekit_client.as_ref() {
+                            if delete_livekit_room {
+                                live_kit.delete_room(livekit_room).await.trace_err();
                             }
                         }
                     }
@@ -682,6 +695,7 @@ impl Server {
         principal: Principal,
         zed_version: ZedVersion,
         geoip_country_code: Option<String>,
+        system_id: Option<String>,
         send_connection_id: Option<oneshot::Sender<ConnectionId>>,
         executor: Executor,
     ) -> impl Future<Output = ()> {
@@ -737,6 +751,7 @@ impl Server {
                 app_state: this.app_state.clone(),
                 http_client,
                 geoip_country_code,
+                system_id,
                 _executor: executor.clone(),
                 supermaven_client,
             };
@@ -1056,6 +1071,7 @@ pub fn routes(server: Arc<Server>) -> Router<(), Body> {
         .layer(Extension(server))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_websocket_request(
     TypedHeader(ProtocolVersion(protocol_version)): TypedHeader<ProtocolVersion>,
     app_version_header: Option<TypedHeader<AppVersionHeader>>,
@@ -1063,6 +1079,7 @@ pub async fn handle_websocket_request(
     Extension(server): Extension<Arc<Server>>,
     Extension(principal): Extension<Principal>,
     country_code_header: Option<TypedHeader<CloudflareIpCountryHeader>>,
+    system_id_header: Option<TypedHeader<SystemIdHeader>>,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
     if protocol_version != rpc::PROTOCOL_VERSION {
@@ -1104,6 +1121,7 @@ pub async fn handle_websocket_request(
                     principal,
                     version,
                     country_code_header.map(|header| header.to_string()),
+                    system_id_header.map(|header| header.to_string()),
                     None,
                     Executor::Production,
                 )
@@ -1204,15 +1222,15 @@ async fn create_room(
     response: Response<proto::CreateRoom>,
     session: Session,
 ) -> Result<()> {
-    let live_kit_room = nanoid::nanoid!(30);
+    let livekit_room = nanoid::nanoid!(30);
 
     let live_kit_connection_info = util::maybe!(async {
-        let live_kit = session.app_state.live_kit_client.as_ref();
+        let live_kit = session.app_state.livekit_client.as_ref();
         let live_kit = live_kit?;
         let user_id = session.user_id().to_string();
 
         let token = live_kit
-            .room_token(&live_kit_room, &user_id.to_string())
+            .room_token(&livekit_room, &user_id.to_string())
             .trace_err()?;
 
         Some(proto::LiveKitConnectionInfo {
@@ -1226,7 +1244,7 @@ async fn create_room(
     let room = session
         .db()
         .await
-        .create_room(session.user_id(), session.connection_id, &live_kit_room)
+        .create_room(session.user_id(), session.connection_id, &livekit_room)
         .await?;
 
     response.send(proto::CreateRoomResponse {
@@ -1278,22 +1296,22 @@ async fn join_room(
             .trace_err();
     }
 
-    let live_kit_connection_info =
-        if let Some(live_kit) = session.app_state.live_kit_client.as_ref() {
-            live_kit
-                .room_token(
-                    &joined_room.room.live_kit_room,
-                    &session.user_id().to_string(),
-                )
-                .trace_err()
-                .map(|token| proto::LiveKitConnectionInfo {
-                    server_url: live_kit.url().into(),
-                    token,
-                    can_publish: true,
-                })
-        } else {
-            None
-        };
+    let live_kit_connection_info = if let Some(live_kit) = session.app_state.livekit_client.as_ref()
+    {
+        live_kit
+            .room_token(
+                &joined_room.room.livekit_room,
+                &session.user_id().to_string(),
+            )
+            .trace_err()
+            .map(|token| proto::LiveKitConnectionInfo {
+                server_url: live_kit.url().into(),
+                token,
+                can_publish: true,
+            })
+    } else {
+        None
+    };
 
     response.send(proto::JoinRoomResponse {
         room: Some(joined_room.room),
@@ -1500,7 +1518,7 @@ async fn set_room_participant_role(
     let user_id = UserId::from_proto(request.user_id);
     let role = ChannelRole::from(request.role());
 
-    let (live_kit_room, can_publish) = {
+    let (livekit_room, can_publish) = {
         let room = session
             .db()
             .await
@@ -1512,18 +1530,18 @@ async fn set_room_participant_role(
             )
             .await?;
 
-        let live_kit_room = room.live_kit_room.clone();
+        let livekit_room = room.livekit_room.clone();
         let can_publish = ChannelRole::from(request.role()).can_use_microphone();
         room_updated(&room, &session.peer);
-        (live_kit_room, can_publish)
+        (livekit_room, can_publish)
     };
 
-    if let Some(live_kit) = session.app_state.live_kit_client.as_ref() {
+    if let Some(live_kit) = session.app_state.livekit_client.as_ref() {
         live_kit
             .update_participant(
-                live_kit_room.clone(),
+                livekit_room.clone(),
                 request.user_id.to_string(),
-                live_kit_server::proto::ParticipantPermission {
+                livekit_server::proto::ParticipantPermission {
                     can_subscribe: true,
                     can_publish,
                     can_publish_data: can_publish,
@@ -1827,6 +1845,7 @@ fn join_project_internal(
             peer_id: Some(session.connection_id.into()),
             replica_id: replica_id.0 as u32,
             user_id: guest_user_id.to_proto(),
+            is_host: false,
         }),
     };
 
@@ -2407,6 +2426,8 @@ async fn get_users(
             id: user.id.to_proto(),
             avatar_url: format!("https://github.com/{}.png?size=128", user.github_login),
             github_login: user.github_login,
+            email: user.email_address,
+            name: user.name,
         })
         .collect();
     response.send(proto::UsersResponse { users })?;
@@ -2438,6 +2459,8 @@ async fn fuzzy_search_users(
             id: user.id.to_proto(),
             avatar_url: format!("https://github.com/{}.png?size=128", user.github_login),
             github_login: user.github_login,
+            name: user.name,
+            email: user.email_address,
         })
         .collect();
     response.send(proto::UsersResponse { users })?;
@@ -3084,7 +3107,7 @@ async fn join_channel_internal(
         let live_kit_connection_info =
             session
                 .app_state
-                .live_kit_client
+                .livekit_client
                 .as_ref()
                 .and_then(|live_kit| {
                     let (can_publish, token) = if role == ChannelRole::Guest {
@@ -3092,7 +3115,7 @@ async fn join_channel_internal(
                             false,
                             live_kit
                                 .guest_token(
-                                    &joined_room.room.live_kit_room,
+                                    &joined_room.room.livekit_room,
                                     &session.user_id().to_string(),
                                 )
                                 .trace_err()?,
@@ -3102,7 +3125,7 @@ async fn join_channel_internal(
                             true,
                             live_kit
                                 .room_token(
-                                    &joined_room.room.live_kit_room,
+                                    &joined_room.room.livekit_room,
                                     &session.user_id().to_string(),
                                 )
                                 .trace_err()?,
@@ -3620,7 +3643,6 @@ async fn count_language_model_tokens(
                 google_ai::API_URL,
                 api_key,
                 serde_json::from_str(&request.request)?,
-                None,
             )
             .await?
         }
@@ -4015,6 +4037,7 @@ async fn get_llm_api_token(
     let flags = db.get_user_flags(session.user_id()).await?;
     let has_language_models_feature_flag = flags.iter().any(|flag| flag == "language-models");
     let has_llm_closed_beta_feature_flag = flags.iter().any(|flag| flag == "llm-closed-beta");
+    let has_predict_edits_feature_flag = flags.iter().any(|flag| flag == "predict-edits");
 
     if !session.is_staff() && !has_language_models_feature_flag {
         Err(anyhow!("permission denied"))?
@@ -4030,12 +4053,18 @@ async fn get_llm_api_token(
         Err(anyhow!("terms of service not accepted"))?
     }
 
-    let mut account_created_at = user.created_at;
-    if let Some(github_created_at) = user.github_user_created_at {
-        account_created_at = account_created_at.min(github_created_at);
-    }
-    if Utc::now().naive_utc() - account_created_at < MIN_ACCOUNT_AGE_FOR_LLM_USE {
-        Err(anyhow!("account too young"))?
+    let has_llm_subscription = session.has_llm_subscription(&db).await?;
+
+    let bypass_account_age_check =
+        has_llm_subscription || flags.iter().any(|flag| flag == "bypass-account-age-check");
+    if !bypass_account_age_check {
+        let mut account_created_at = user.created_at;
+        if let Some(github_created_at) = user.github_user_created_at {
+            account_created_at = account_created_at.min(github_created_at);
+        }
+        if Utc::now().naive_utc() - account_created_at < MIN_ACCOUNT_AGE_FOR_LLM_USE {
+            Err(anyhow!("account too young"))?
+        }
     }
 
     let billing_preferences = db.get_billing_preferences(user.id).await?;
@@ -4045,8 +4074,10 @@ async fn get_llm_api_token(
         session.is_staff(),
         billing_preferences,
         has_llm_closed_beta_feature_flag,
-        session.has_llm_subscription(&db).await?,
+        has_predict_edits_feature_flag,
+        has_llm_subscription,
         session.current_plan(&db).await?,
+        session.system_id.clone(),
         &session.app_state.config,
     )?;
     response.send(proto::GetLlmTokenResponse { token })?;
@@ -4300,8 +4331,8 @@ async fn leave_room_for_session(session: &Session, connection_id: ConnectionId) 
 
     let room_id;
     let canceled_calls_to_user_ids;
-    let live_kit_room;
-    let delete_live_kit_room;
+    let livekit_room;
+    let delete_livekit_room;
     let room;
     let channel;
 
@@ -4314,8 +4345,8 @@ async fn leave_room_for_session(session: &Session, connection_id: ConnectionId) 
 
         room_id = RoomId::from_proto(left_room.room.id);
         canceled_calls_to_user_ids = mem::take(&mut left_room.canceled_calls_to_user_ids);
-        live_kit_room = mem::take(&mut left_room.room.live_kit_room);
-        delete_live_kit_room = left_room.deleted;
+        livekit_room = mem::take(&mut left_room.room.livekit_room);
+        delete_livekit_room = left_room.deleted;
         room = mem::take(&mut left_room.room);
         channel = mem::take(&mut left_room.channel);
 
@@ -4355,14 +4386,14 @@ async fn leave_room_for_session(session: &Session, connection_id: ConnectionId) 
         update_user_contacts(contact_user_id, session).await?;
     }
 
-    if let Some(live_kit) = session.app_state.live_kit_client.as_ref() {
+    if let Some(live_kit) = session.app_state.livekit_client.as_ref() {
         live_kit
-            .remove_participant(live_kit_room.clone(), session.user_id().to_string())
+            .remove_participant(livekit_room.clone(), session.user_id().to_string())
             .await
             .trace_err();
 
-        if delete_live_kit_room {
-            live_kit.delete_room(live_kit_room).await.trace_err();
+        if delete_livekit_room {
+            live_kit.delete_room(livekit_room).await.trace_err();
         }
     }
 

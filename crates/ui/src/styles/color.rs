@@ -1,8 +1,8 @@
-use gpui::{Hsla, WindowContext};
+use gpui::{App, Hsla};
 use theme::ActiveTheme;
 
 /// Sets a color that has a consistent meaning across all themes.
-#[derive(Debug, Default, PartialEq, Copy, Clone)]
+#[derive(Debug, Default, Eq, PartialEq, Copy, Clone)]
 pub enum Color {
     #[default]
     /// The default text color. Might be known as "foreground" or "primary" in
@@ -62,7 +62,7 @@ pub enum Color {
 
 impl Color {
     /// Returns the Color's HSLA value.
-    pub fn color(&self, cx: &WindowContext) -> Hsla {
+    pub fn color(&self, cx: &App) -> Hsla {
         match self {
             Color::Default => cx.theme().colors().text,
             Color::Muted => cx.theme().colors().text_muted,
@@ -84,5 +84,11 @@ impl Color {
             Color::Warning => cx.theme().status().warning,
             Color::Custom(color) => *color,
         }
+    }
+}
+
+impl From<Hsla> for Color {
+    fn from(color: Hsla) -> Self {
+        Color::Custom(color)
     }
 }

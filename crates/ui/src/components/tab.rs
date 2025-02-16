@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use gpui::{AnyElement, IntoElement, Stateful};
 use smallvec::SmallVec;
 
-use crate::{prelude::*, BASE_REM_SIZE_IN_PX};
+use crate::prelude::*;
 
 /// The position of a [`Tab`] within a list of tabs.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -27,7 +27,7 @@ pub enum TabCloseSide {
     End,
 }
 
-#[derive(IntoElement)]
+#[derive(IntoElement, IntoComponent)]
 pub struct Tab {
     div: Stateful<Div>,
     selected: bool,
@@ -54,10 +54,6 @@ impl Tab {
         }
     }
 
-    pub const CONTAINER_HEIGHT_IN_REMS: f32 = 29. / BASE_REM_SIZE_IN_PX;
-
-    const CONTENT_HEIGHT_IN_REMS: f32 = 28. / BASE_REM_SIZE_IN_PX;
-
     pub fn position(mut self, position: TabPosition) -> Self {
         self.position = position;
         self
@@ -77,6 +73,14 @@ impl Tab {
         self.end_slot = element.into().map(IntoElement::into_any_element);
         self
     }
+
+    pub fn content_height(cx: &mut App) -> Pixels {
+        DynamicSpacing::Base32.px(cx) - px(1.)
+    }
+
+    pub fn container_height(cx: &mut App) -> Pixels {
+        DynamicSpacing::Base32.px(cx)
+    }
 }
 
 impl InteractiveElement for Tab {
@@ -87,8 +91,8 @@ impl InteractiveElement for Tab {
 
 impl StatefulInteractiveElement for Tab {}
 
-impl Selectable for Tab {
-    fn selected(mut self, selected: bool) -> Self {
+impl Toggleable for Tab {
+    fn toggle_state(mut self, selected: bool) -> Self {
         self.selected = selected;
         self
     }
@@ -102,7 +106,7 @@ impl ParentElement for Tab {
 
 impl RenderOnce for Tab {
     #[allow(refining_impl_trait)]
-    fn render(self, cx: &mut WindowContext) -> Stateful<Div> {
+    fn render(self, _: &mut Window, cx: &mut App) -> Stateful<Div> {
         let (text_color, tab_bg, _tab_hover_bg, _tab_active_bg) = match self.selected {
             false => (
                 cx.theme().colors().text_muted,
@@ -130,7 +134,7 @@ impl RenderOnce for Tab {
         };
 
         self.div
-            .h(rems(Self::CONTAINER_HEIGHT_IN_REMS))
+            .h(Tab::container_height(cx))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
             .map(|this| match self.position {
@@ -157,13 +161,58 @@ impl RenderOnce for Tab {
                 h_flex()
                     .group("")
                     .relative()
-                    .h(rems(Self::CONTENT_HEIGHT_IN_REMS))
-                    .px(crate::custom_spacing(cx, 4.))
-                    .gap(Spacing::Small.rems(cx))
+                    .h(Tab::content_height(cx))
+                    .px(DynamicSpacing::Base04.px(cx))
+                    .gap(DynamicSpacing::Base04.rems(cx))
                     .text_color(text_color)
                     .child(start_slot)
                     .children(self.children)
                     .child(end_slot),
             )
+    }
+}
+
+impl ComponentPreview for Tab {
+    fn preview(_window: &mut Window, _cx: &App) -> AnyElement {
+        v_flex()
+            .gap_6()
+            .children(vec![example_group_with_title(
+                "Variations",
+                vec![
+                    single_example(
+                        "Default",
+                        Tab::new("default").child("Default Tab").into_any_element(),
+                    ),
+                    single_example(
+                        "Selected",
+                        Tab::new("selected")
+                            .toggle_state(true)
+                            .child("Selected Tab")
+                            .into_any_element(),
+                    ),
+                    single_example(
+                        "First",
+                        Tab::new("first")
+                            .position(TabPosition::First)
+                            .child("First Tab")
+                            .into_any_element(),
+                    ),
+                    single_example(
+                        "Middle",
+                        Tab::new("middle")
+                            .position(TabPosition::Middle(Ordering::Equal))
+                            .child("Middle Tab")
+                            .into_any_element(),
+                    ),
+                    single_example(
+                        "Last",
+                        Tab::new("last")
+                            .position(TabPosition::Last)
+                            .child("Last Tab")
+                            .into_any_element(),
+                    ),
+                ],
+            )])
+            .into_any_element()
     }
 }

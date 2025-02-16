@@ -40,6 +40,7 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
+    use release_channel::{ReleaseChannel, RELEASE_CHANNEL};
     use remote::proxy::ProxyLaunchError;
     use remote_server::unix::{execute_proxy, execute_run};
 
@@ -72,7 +73,18 @@ fn main() {
             }
         },
         Some(Commands::Version) => {
-            println!("{}", env!("ZED_PKG_VERSION"));
+            let release_channel = *RELEASE_CHANNEL;
+            match release_channel {
+                ReleaseChannel::Stable | ReleaseChannel::Preview => {
+                    println!("{}", env!("ZED_PKG_VERSION"))
+                }
+                ReleaseChannel::Nightly | ReleaseChannel::Dev => {
+                    println!(
+                        "{}",
+                        option_env!("ZED_COMMIT_SHA").unwrap_or(release_channel.dev_name())
+                    )
+                }
+            };
             std::process::exit(0);
         }
         None => {

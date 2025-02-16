@@ -20,7 +20,7 @@ pub fn config_dir() -> &'static PathBuf {
                 .join("Zed");
         }
 
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             return if let Ok(flatpak_xdg_config) = std::env::var("FLATPAK_XDG_CONFIG_HOME") {
                 flatpak_xdg_config.into()
             } else {
@@ -41,7 +41,7 @@ pub fn support_dir() -> &'static PathBuf {
             return home_dir().join("Library/Application Support/Zed");
         }
 
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             return if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
                 flatpak_xdg_data.into()
             } else {
@@ -76,7 +76,7 @@ pub fn temp_dir() -> &'static PathBuf {
                 .join("Zed");
         }
 
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             return if let Ok(flatpak_xdg_cache) = std::env::var("FLATPAK_XDG_CACHE_HOME") {
                 flatpak_xdg_cache.into()
             } else {
@@ -145,10 +145,22 @@ pub fn settings_file() -> &'static PathBuf {
     SETTINGS_FILE.get_or_init(|| config_dir().join("settings.json"))
 }
 
+/// Returns the path to the `settings_backup.json` file.
+pub fn settings_backup_file() -> &'static PathBuf {
+    static SETTINGS_FILE: OnceLock<PathBuf> = OnceLock::new();
+    SETTINGS_FILE.get_or_init(|| config_dir().join("settings_backup.json"))
+}
+
 /// Returns the path to the `keymap.json` file.
 pub fn keymap_file() -> &'static PathBuf {
     static KEYMAP_FILE: OnceLock<PathBuf> = OnceLock::new();
     KEYMAP_FILE.get_or_init(|| config_dir().join("keymap.json"))
+}
+
+/// Returns the path to the `keymap_backup.json` file.
+pub fn keymap_backup_file() -> &'static PathBuf {
+    static KEYMAP_FILE: OnceLock<PathBuf> = OnceLock::new();
+    KEYMAP_FILE.get_or_init(|| config_dir().join("keymap_backup.json"))
 }
 
 /// Returns the path to the `tasks.json` file.
@@ -165,12 +177,34 @@ pub fn extensions_dir() -> &'static PathBuf {
     EXTENSIONS_DIR.get_or_init(|| support_dir().join("extensions"))
 }
 
+/// Returns the path to the extensions directory.
+///
+/// This is where installed extensions are stored on a remote.
+pub fn remote_extensions_dir() -> &'static PathBuf {
+    static EXTENSIONS_DIR: OnceLock<PathBuf> = OnceLock::new();
+    EXTENSIONS_DIR.get_or_init(|| support_dir().join("remote_extensions"))
+}
+
+/// Returns the path to the extensions directory.
+///
+/// This is where installed extensions are stored on a remote.
+pub fn remote_extensions_uploads_dir() -> &'static PathBuf {
+    static UPLOAD_DIR: OnceLock<PathBuf> = OnceLock::new();
+    UPLOAD_DIR.get_or_init(|| remote_extensions_dir().join("uploads"))
+}
+
 /// Returns the path to the themes directory.
 ///
 /// This is where themes that are not provided by extensions are stored.
 pub fn themes_dir() -> &'static PathBuf {
     static THEMES_DIR: OnceLock<PathBuf> = OnceLock::new();
     THEMES_DIR.get_or_init(|| config_dir().join("themes"))
+}
+
+/// Returns the path to the snippets directory.
+pub fn snippets_dir() -> &'static PathBuf {
+    static SNIPPETS_DIR: OnceLock<PathBuf> = OnceLock::new();
+    SNIPPETS_DIR.get_or_init(|| config_dir().join("snippets"))
 }
 
 /// Returns the path to the contexts directory.

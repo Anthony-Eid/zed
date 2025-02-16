@@ -1,6 +1,9 @@
-#![cfg_attr(any(target_os = "linux", target_os = "windows"), allow(dead_code))]
+#![cfg_attr(
+    any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
+    allow(dead_code)
+)]
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use cli::{ipc::IpcOneShotServer, CliRequest, CliResponse, IpcHandshake};
 use collections::HashMap;
@@ -15,6 +18,9 @@ use std::{
 use tempfile::NamedTempFile;
 use util::paths::PathWithPosition;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use std::io::IsTerminal;
+
 struct Detect;
 
 trait InstalledApp {
@@ -27,7 +33,19 @@ trait InstalledApp {
 #[command(
     name = "zed",
     disable_version_flag = true,
-    after_help = "To read from stdin, append '-' (e.g. 'ps axf | zed -')"
+    before_help = "The Zed CLI binary.
+This CLI is a separate binary that invokes Zed.
+
+Examples:
+    `zed`
+          Simply opens Zed
+    `zed --foreground`
+          Runs in foreground (shows all logs)
+    `zed path-to-your-project`
+          Open your project in Zed
+    `zed -n path-to-file `
+          Open file/folder in a new window",
+    after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'"
 )]
 struct Args {
     /// Wait for all of the given paths to be opened/closed before exiting.
@@ -39,10 +57,9 @@ struct Args {
     /// Create a new workspace
     #[arg(short, long, overrides_with = "add")]
     new: bool,
-    /// A sequence of space-separated paths that you want to open.
+    /// The paths to open in Zed (space-separated).
     ///
-    /// Use `path:line:row` syntax to open a file at a specific location.
-    /// Non-existing paths and directories will ignore `:line:row` suffix.
+    /// Use `path:line:column` syntax to open a file at the given line and column.
     paths_with_position: Vec<String>,
     /// Print Zed's version and the app path.
     #[arg(short, long)]
@@ -56,6 +73,13 @@ struct Args {
     /// Run zed in dev-server mode
     #[arg(long)]
     dev_server_token: Option<String>,
+    /// Uninstall Zed from user system
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        not(feature = "no-bundled-uninstall")
+    ))]
+    #[arg(long)]
+    uninstall: bool,
 }
 
 fn parse_path_with_position(argument_str: &str) -> anyhow::Result<String> {
@@ -63,7 +87,7 @@ fn parse_path_with_position(argument_str: &str) -> anyhow::Result<String> {
         Ok(existing_path) => PathWithPosition::from_path(existing_path),
         Err(_) => {
             let path = PathWithPosition::parse_str(argument_str);
-            let curdir = env::current_dir().context("reteiving current directory")?;
+            let curdir = env::current_dir().context("retrieving current directory")?;
             path.map_path(|path| match fs::canonicalize(&path) {
                 Ok(path) => Ok(path),
                 Err(e) => {
@@ -88,7 +112,7 @@ fn parse_path_with_position(argument_str: &str) -> anyhow::Result<String> {
 
 fn main() -> Result<()> {
     // Exit flatpak sandbox if needed
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         flatpak::try_restart_to_host();
         flatpak::ld_extra_libs();
@@ -106,7 +130,7 @@ fn main() -> Result<()> {
     }
     let args = Args::parse();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     let args = flatpak::set_bin_if_no_escape(args);
 
     let app = Detect::detect(args.zed.as_deref()).context("Bundle detection")?;
@@ -114,6 +138,29 @@ fn main() -> Result<()> {
     if args.version {
         println!("{}", app.zed_version_string());
         return Ok(());
+    }
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        not(feature = "no-bundled-uninstall")
+    ))]
+    if args.uninstall {
+        static UNINSTALL_SCRIPT: &[u8] = include_bytes!("../../../script/uninstall.sh");
+
+        let tmp_dir = tempfile::tempdir()?;
+        let script_path = tmp_dir.path().join("uninstall.sh");
+        fs::write(&script_path, UNINSTALL_SCRIPT)?;
+
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
+
+        let status = std::process::Command::new("sh")
+            .arg(&script_path)
+            .env("ZED_CHANNEL", &*release_channel::RELEASE_CHANNEL_NAME)
+            .status()
+            .context("Failed to execute uninstall script")?;
+
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     let (server, server_name) =
@@ -128,7 +175,25 @@ fn main() -> Result<()> {
         None
     };
 
-    let env = Some(std::env::vars().collect::<HashMap<_, _>>());
+    let env = {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            // On Linux, the desktop entry uses `cli` to spawn `zed`.
+            // We need to handle env vars correctly since std::env::vars() may not contain
+            // project-specific vars (e.g. those set by direnv).
+            // By setting env to None here, the LSP will use worktree env vars instead,
+            // which is what we want.
+            if !std::io::stdout().is_terminal() {
+                None
+            } else {
+                Some(std::env::vars().collect::<HashMap<_, _>>())
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        Some(std::env::vars().collect::<HashMap<_, _>>())
+    };
+
     let exit_status = Arc::new(Mutex::new(None));
     let mut paths = vec![];
     let mut urls = vec![];
@@ -220,7 +285,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod linux {
     use std::{
         env,
@@ -229,6 +294,7 @@ mod linux {
         os::unix::net::{SocketAddr, UnixDatagram},
         path::{Path, PathBuf},
         process::{self, ExitStatus},
+        sync::LazyLock,
         thread,
         time::Duration,
     };
@@ -236,12 +302,11 @@ mod linux {
     use anyhow::anyhow;
     use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
     use fork::Fork;
-    use once_cell::sync::Lazy;
 
     use crate::{Detect, InstalledApp};
 
-    static RELEASE_CHANNEL: Lazy<String> =
-        Lazy::new(|| include_str!("../../zed/RELEASE_CHANNEL").trim().to_string());
+    static RELEASE_CHANNEL: LazyLock<String> =
+        LazyLock::new(|| include_str!("../../zed/RELEASE_CHANNEL").trim().to_string());
 
     struct App(PathBuf);
 
@@ -274,13 +339,17 @@ mod linux {
     impl InstalledApp for App {
         fn zed_version_string(&self) -> String {
             format!(
-                "Zed {}{} – {}",
+                "Zed {}{}{} – {}",
                 if *RELEASE_CHANNEL == "stable" {
                     "".to_string()
                 } else {
-                    format!(" {} ", *RELEASE_CHANNEL)
+                    format!("{} ", *RELEASE_CHANNEL)
                 },
                 option_env!("RELEASE_VERSION").unwrap_or_default(),
+                match option_env!("ZED_COMMIT_SHA") {
+                    Some(commit_sha) => format!(" {commit_sha} "),
+                    None => "".to_string(),
+                },
                 self.0.display(),
             )
         }
@@ -344,7 +413,7 @@ mod linux {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod flatpak {
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -482,7 +551,7 @@ mod windows {
 
 #[cfg(target_os = "macos")]
 mod mac_os {
-    use anyhow::{anyhow, Context, Result};
+    use anyhow::{anyhow, Context as _, Result};
     use core_foundation::{
         array::{CFArray, CFIndex},
         string::kCFStringEncodingUTF8,

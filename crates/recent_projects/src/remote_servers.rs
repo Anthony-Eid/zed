@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,17 +10,20 @@ use futures::FutureExt;
 use gpui::canvas;
 use gpui::ClipboardItem;
 use gpui::Task;
-use gpui::WeakView;
+use gpui::WeakEntity;
 use gpui::{
-    AnyElement, AppContext, DismissEvent, EventEmitter, FocusHandle, FocusableView, Model,
-    PromptLevel, ScrollHandle, View, ViewContext,
+    AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    PromptLevel, ScrollHandle, Window,
 };
 use picker::Picker;
 use project::Project;
+use remote::ssh_session::ConnectionIdentifier;
 use remote::SshConnectionOptions;
 use remote::SshRemoteClient;
 use settings::update_settings_file;
 use settings::Settings;
+use ui::Navigable;
+use ui::NavigableEntry;
 use ui::{
     prelude::*, IconButtonShape, List, ListItem, ListSeparator, Modal, ModalHeader, Scrollbar,
     ScrollbarState, Section, Tooltip,
@@ -41,27 +45,26 @@ use crate::ssh_connections::SshPrompt;
 use crate::ssh_connections::SshSettings;
 use crate::OpenRemote;
 
+mod navigation_base {}
 pub struct RemoteServerProjects {
     mode: Mode,
     focus_handle: FocusHandle,
-    scroll_handle: ScrollHandle,
-    workspace: WeakView<Workspace>,
-    selectable_items: SelectableItemList,
-    retained_connections: Vec<Model<SshRemoteClient>>,
+    workspace: WeakEntity<Workspace>,
+    retained_connections: Vec<Entity<SshRemoteClient>>,
 }
 
 struct CreateRemoteServer {
-    address_editor: View<Editor>,
+    address_editor: Entity<Editor>,
     address_error: Option<SharedString>,
-    ssh_prompt: Option<View<SshPrompt>>,
+    ssh_prompt: Option<Entity<SshPrompt>>,
     _creating: Option<Task<Option<()>>>,
 }
 
 impl CreateRemoteServer {
-    fn new(cx: &mut WindowContext<'_>) -> Self {
-        let address_editor = cx.new_view(Editor::single_line);
+    fn new(window: &mut Window, cx: &mut App) -> Self {
+        let address_editor = cx.new(|cx| Editor::single_line(window, cx));
         address_editor.update(cx, |this, cx| {
-            this.focus_handle(cx).focus(cx);
+            this.focus_handle(cx).focus(window);
         });
         Self {
             address_editor,
@@ -75,30 +78,20 @@ impl CreateRemoteServer {
 struct ProjectPicker {
     connection_string: SharedString,
     nickname: Option<SharedString>,
-    picker: View<Picker<OpenPathDelegate>>,
+    picker: Entity<Picker<OpenPathDelegate>>,
     _path_task: Shared<Task<Option<()>>>,
-}
-
-type SelectedItemCallback =
-    Box<dyn Fn(&mut RemoteServerProjects, &mut ViewContext<RemoteServerProjects>) + 'static>;
-
-/// Used to implement keyboard navigation for SSH modal.
-#[derive(Default)]
-struct SelectableItemList {
-    items: Vec<SelectedItemCallback>,
-    active_item: Option<usize>,
 }
 
 struct EditNicknameState {
     index: usize,
-    editor: View<Editor>,
+    editor: Entity<Editor>,
 }
 
 impl EditNicknameState {
-    fn new(index: usize, cx: &mut WindowContext<'_>) -> Self {
+    fn new(index: usize, window: &mut Window, cx: &mut App) -> Self {
         let this = Self {
             index,
-            editor: cx.new_view(Editor::single_line),
+            editor: cx.new(|cx| Editor::single_line(window, cx)),
         };
         let starting_text = SshSettings::get_global(cx)
             .ssh_connections()
@@ -108,70 +101,16 @@ impl EditNicknameState {
         this.editor.update(cx, |this, cx| {
             this.set_placeholder_text("Add a nickname for this server", cx);
             if let Some(starting_text) = starting_text {
-                this.set_text(starting_text, cx);
+                this.set_text(starting_text, window, cx);
             }
         });
-        this.editor.focus_handle(cx).focus(cx);
+        this.editor.focus_handle(cx).focus(window);
         this
     }
 }
 
-impl SelectableItemList {
-    fn reset(&mut self) {
-        self.items.clear();
-    }
-
-    fn reset_selection(&mut self) {
-        self.active_item.take();
-    }
-
-    fn prev(&mut self, _: &mut WindowContext<'_>) {
-        match self.active_item.as_mut() {
-            Some(active_index) => {
-                *active_index = active_index.checked_sub(1).unwrap_or(self.items.len() - 1)
-            }
-            None => {
-                self.active_item = Some(self.items.len() - 1);
-            }
-        }
-    }
-
-    fn next(&mut self, _: &mut WindowContext<'_>) {
-        match self.active_item.as_mut() {
-            Some(active_index) => {
-                if *active_index + 1 < self.items.len() {
-                    *active_index += 1;
-                } else {
-                    *active_index = 0;
-                }
-            }
-            None => {
-                self.active_item = Some(0);
-            }
-        }
-    }
-
-    fn add_item(&mut self, callback: SelectedItemCallback) {
-        self.items.push(callback)
-    }
-
-    fn is_selected(&self) -> bool {
-        self.active_item == self.items.len().checked_sub(1)
-    }
-
-    fn confirm(
-        &self,
-        remote_modal: &mut RemoteServerProjects,
-        cx: &mut ViewContext<RemoteServerProjects>,
-    ) {
-        if let Some(active_item) = self.active_item.and_then(|ix| self.items.get(ix)) {
-            active_item(remote_modal, cx);
-        }
-    }
-}
-
-impl FocusableView for ProjectPicker {
-    fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
+impl Focusable for ProjectPicker {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.picker.focus_handle(cx)
     }
 }
@@ -180,34 +119,36 @@ impl ProjectPicker {
     fn new(
         ix: usize,
         connection: SshConnectionOptions,
-        project: Model<Project>,
-        workspace: WeakView<Workspace>,
-        cx: &mut ViewContext<RemoteServerProjects>,
-    ) -> View<Self> {
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<RemoteServerProjects>,
+    ) -> Entity<Self> {
         let (tx, rx) = oneshot::channel();
         let lister = project::DirectoryLister::Project(project.clone());
         let query = lister.default_query(cx);
         let delegate = file_finder::OpenPathDelegate::new(tx, lister);
 
-        let picker = cx.new_view(|cx| {
-            let picker = Picker::uniform_list(delegate, cx)
+        let picker = cx.new(|cx| {
+            let picker = Picker::uniform_list(delegate, window, cx)
                 .width(rems(34.))
                 .modal(false);
-            picker.set_query(query, cx);
+            picker.set_query(query, window, cx);
             picker
         });
         let connection_string = connection.connection_string().into();
         let nickname = connection.nickname.clone().map(|nick| nick.into());
         let _path_task = cx
-            .spawn({
+            .spawn_in(window, {
                 let workspace = workspace.clone();
                 move |this, mut cx| async move {
                     let Ok(Some(paths)) = rx.await else {
                         workspace
-                            .update(&mut cx, |workspace, cx| {
-                                let weak = cx.view().downgrade();
-                                workspace
-                                    .toggle_modal(cx, |cx| RemoteServerProjects::new(cx, weak));
+                            .update_in(&mut cx, |workspace, window, cx| {
+                                let weak = cx.entity().downgrade();
+                                workspace.toggle_modal(window, cx, |window, cx| {
+                                    RemoteServerProjects::new(window, cx, weak)
+                                });
                             })
                             .log_err()?;
                         return None;
@@ -217,11 +158,11 @@ impl ProjectPicker {
                         .update(&mut cx, |workspace, _| workspace.app_state().clone())
                         .ok()?;
                     let options = cx
-                        .update(|cx| (app_state.build_window_options)(None, cx))
+                        .update(|_, cx| (app_state.build_window_options)(None, cx))
                         .log_err()?;
 
-                    cx.open_window(options, |cx| {
-                        cx.activate_window();
+                    cx.open_window(options, |window, cx| {
+                        window.activate_window();
 
                         let fs = app_state.fs.clone();
                         update_settings_file::<SshSettings>(fs, cx, {
@@ -235,7 +176,7 @@ impl ProjectPicker {
                                     .as_mut()
                                     .and_then(|connections| connections.get_mut(ix))
                                 {
-                                    server.projects.push(SshProject { paths })
+                                    server.projects.insert(SshProject { paths });
                                 }
                             }
                         });
@@ -248,28 +189,20 @@ impl ProjectPicker {
                                 })
                             })
                             .collect::<Vec<_>>();
-                        cx.spawn(|_| async move {
-                            for task in tasks {
-                                task.await?;
-                            }
-                            Ok(())
-                        })
-                        .detach_and_prompt_err(
-                            "Failed to open path",
-                            cx,
-                            |_, _| None,
-                        );
+                        window
+                            .spawn(cx, |_| async move {
+                                for task in tasks {
+                                    task.await?;
+                                }
+                                Ok(())
+                            })
+                            .detach_and_prompt_err("Failed to open path", window, cx, |_, _, _| {
+                                None
+                            });
 
-                        cx.new_view(|cx| {
-                            let workspace =
-                                Workspace::new(None, project.clone(), app_state.clone(), cx);
-
-                            workspace
-                                .client()
-                                .telemetry()
-                                .report_app_event("create ssh project".to_string());
-
-                            workspace
+                        cx.new(|cx| {
+                            telemetry::event!("SSH Project Created");
+                            Workspace::new(None, project.clone(), app_state.clone(), window, cx)
                         })
                     })
                     .log_err();
@@ -281,7 +214,7 @@ impl ProjectPicker {
                 }
             })
             .shared();
-        cx.new_view(|_| Self {
+        cx.new(|_| Self {
             _path_task,
             picker,
             connection_string,
@@ -291,7 +224,7 @@ impl ProjectPicker {
 }
 
 impl gpui::Render for ProjectPicker {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .child(
                 SshConnectionHeader {
@@ -299,7 +232,7 @@ impl gpui::Render for ProjectPicker {
                     paths: Default::default(),
                     nickname: self.nickname.clone(),
                 }
-                .render(cx),
+                .render(window, cx),
             )
             .child(
                 div()
@@ -309,82 +242,126 @@ impl gpui::Render for ProjectPicker {
             )
     }
 }
+
+#[derive(Clone)]
+struct ProjectEntry {
+    open_folder: NavigableEntry,
+    projects: Vec<(NavigableEntry, SshProject)>,
+    configure: NavigableEntry,
+    connection: SshConnection,
+}
+
+#[derive(Clone)]
+struct DefaultState {
+    scrollbar: ScrollbarState,
+    add_new_server: NavigableEntry,
+    servers: Vec<ProjectEntry>,
+}
+impl DefaultState {
+    fn new(cx: &mut App) -> Self {
+        let handle = ScrollHandle::new();
+        let scrollbar = ScrollbarState::new(handle.clone());
+        let add_new_server = NavigableEntry::new(&handle, cx);
+        let servers = SshSettings::get_global(cx)
+            .ssh_connections()
+            .map(|connection| {
+                let open_folder = NavigableEntry::new(&handle, cx);
+                let configure = NavigableEntry::new(&handle, cx);
+                let projects = connection
+                    .projects
+                    .iter()
+                    .map(|project| (NavigableEntry::new(&handle, cx), project.clone()))
+                    .collect();
+                ProjectEntry {
+                    open_folder,
+                    configure,
+                    projects,
+                    connection,
+                }
+            })
+            .collect();
+        Self {
+            scrollbar,
+            add_new_server,
+            servers,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ViewServerOptionsState {
+    server_index: usize,
+    connection: SshConnection,
+    entries: [NavigableEntry; 4],
+}
 enum Mode {
-    Default(ScrollbarState),
-    ViewServerOptions(usize, SshConnection),
+    Default(DefaultState),
+    ViewServerOptions(ViewServerOptionsState),
     EditNickname(EditNicknameState),
-    ProjectPicker(View<ProjectPicker>),
+    ProjectPicker(Entity<ProjectPicker>),
     CreateRemoteServer(CreateRemoteServer),
 }
 
 impl Mode {
-    fn default_mode() -> Self {
-        let handle = ScrollHandle::new();
-        Self::Default(ScrollbarState::new(handle))
+    fn default_mode(cx: &mut App) -> Self {
+        Self::Default(DefaultState::new(cx))
     }
 }
 impl RemoteServerProjects {
-    pub fn register(workspace: &mut Workspace, _: &mut ViewContext<Workspace>) {
-        workspace.register_action(|workspace, _: &OpenRemote, cx| {
-            let handle = cx.view().downgrade();
-            workspace.toggle_modal(cx, |cx| Self::new(cx, handle))
+    pub fn register(
+        workspace: &mut Workspace,
+        _window: Option<&mut Window>,
+        _: &mut Context<Workspace>,
+    ) {
+        workspace.register_action(|workspace, _: &OpenRemote, window, cx| {
+            let handle = cx.entity().downgrade();
+            workspace.toggle_modal(window, cx, |window, cx| Self::new(window, cx, handle))
         });
     }
 
-    pub fn open(workspace: View<Workspace>, cx: &mut WindowContext) {
+    pub fn open(workspace: Entity<Workspace>, window: &mut Window, cx: &mut App) {
         workspace.update(cx, |workspace, cx| {
-            let handle = cx.view().downgrade();
-            workspace.toggle_modal(cx, |cx| Self::new(cx, handle))
+            let handle = cx.entity().downgrade();
+            workspace.toggle_modal(window, cx, |window, cx| Self::new(window, cx, handle))
         })
     }
 
-    pub fn new(cx: &mut ViewContext<Self>, workspace: WeakView<Workspace>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        workspace: WeakEntity<Workspace>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        let mut base_style = cx.text_style();
+        let mut base_style = window.text_style();
         base_style.refine(&gpui::TextStyleRefinement {
             color: Some(cx.theme().colors().editor_foreground),
             ..Default::default()
         });
 
         Self {
-            mode: Mode::default_mode(),
+            mode: Mode::default_mode(cx),
             focus_handle,
-            scroll_handle: ScrollHandle::new(),
             workspace,
-            selectable_items: Default::default(),
             retained_connections: Vec::new(),
         }
-    }
-
-    fn next_item(&mut self, _: &menu::SelectNext, cx: &mut ViewContext<Self>) {
-        if !matches!(self.mode, Mode::Default(_) | Mode::ViewServerOptions(_, _)) {
-            return;
-        }
-
-        self.selectable_items.next(cx);
-    }
-
-    fn prev_item(&mut self, _: &menu::SelectPrev, cx: &mut ViewContext<Self>) {
-        if !matches!(self.mode, Mode::Default(_) | Mode::ViewServerOptions(_, _)) {
-            return;
-        }
-        self.selectable_items.prev(cx);
     }
 
     pub fn project_picker(
         ix: usize,
         connection_options: remote::SshConnectionOptions,
-        project: Model<Project>,
-        cx: &mut ViewContext<Self>,
-        workspace: WeakView<Workspace>,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        workspace: WeakEntity<Workspace>,
     ) -> Self {
-        let mut this = Self::new(cx, workspace.clone());
+        let mut this = Self::new(window, cx, workspace.clone());
         this.mode = Mode::ProjectPicker(ProjectPicker::new(
             ix,
             connection_options,
             project,
             workspace,
+            window,
             cx,
         ));
         cx.notify();
@@ -392,7 +369,12 @@ impl RemoteServerProjects {
         this
     }
 
-    fn create_ssh_server(&mut self, editor: View<Editor>, cx: &mut ViewContext<Self>) {
+    fn create_ssh_server(
+        &mut self,
+        editor: Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let input = get_text(&editor, cx);
         if input.is_empty() {
             return;
@@ -410,31 +392,26 @@ impl RemoteServerProjects {
                 return;
             }
         };
-        let ssh_prompt = cx.new_view(|cx| SshPrompt::new(&connection_options, cx));
+        let ssh_prompt = cx.new(|cx| SshPrompt::new(&connection_options, window, cx));
 
         let connection = connect_over_ssh(
-            connection_options.remote_server_identifier(),
+            ConnectionIdentifier::setup(),
             connection_options.clone(),
             ssh_prompt.clone(),
+            window,
             cx,
         )
-        .prompt_err("Failed to connect", cx, |_, _| None);
+        .prompt_err("Failed to connect", window, cx, |_, _, _| None);
 
         let address_editor = editor.clone();
         let creating = cx.spawn(move |this, mut cx| async move {
             match connection.await {
                 Some(Some(client)) => this
                     .update(&mut cx, |this, cx| {
-                        let _ = this.workspace.update(cx, |workspace, _| {
-                            workspace
-                                .client()
-                                .telemetry()
-                                .report_app_event("create ssh server".to_string())
-                        });
+                        telemetry::event!("SSH Server Created");
                         this.retained_connections.push(client);
                         this.add_ssh_server(connection_options, cx);
-                        this.mode = Mode::default_mode();
-                        this.selectable_items.reset_selection();
+                        this.mode = Mode::default_mode(cx);
                         cx.notify()
                     })
                     .log_err(),
@@ -469,11 +446,16 @@ impl RemoteServerProjects {
 
     fn view_server_options(
         &mut self,
-        (index, connection): (usize, SshConnection),
-        cx: &mut ViewContext<Self>,
+        (server_index, connection): (usize, SshConnection),
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        self.selectable_items.reset_selection();
-        self.mode = Mode::ViewServerOptions(index, connection);
+        self.mode = Mode::ViewServerOptions(ViewServerOptionsState {
+            server_index,
+            connection,
+            entries: std::array::from_fn(|_| NavigableEntry::focusable(cx)),
+        });
+        self.focus_handle(cx).focus(window);
         cx.notify();
     }
 
@@ -481,7 +463,8 @@ impl RemoteServerProjects {
         &mut self,
         ix: usize,
         ssh_connection: SshConnection,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -489,9 +472,9 @@ impl RemoteServerProjects {
 
         let connection_options = ssh_connection.into();
         workspace.update(cx, |_, cx| {
-            cx.defer(move |workspace, cx| {
-                workspace.toggle_modal(cx, |cx| {
-                    SshConnectionModal::new(&connection_options, Vec::new(), cx)
+            cx.defer_in(window, move |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    SshConnectionModal::new(&connection_options, Vec::new(), window, cx)
                 });
                 let prompt = workspace
                     .active_modal::<SshConnectionModal>(cx)
@@ -501,14 +484,15 @@ impl RemoteServerProjects {
                     .clone();
 
                 let connect = connect_over_ssh(
-                    connection_options.remote_server_identifier(),
+                    ConnectionIdentifier::setup(),
                     connection_options.clone(),
                     prompt,
+                    window,
                     cx,
                 )
-                .prompt_err("Failed to connect", cx, |_, _| None);
+                .prompt_err("Failed to connect", window, cx, |_, _, _| None);
 
-                cx.spawn(move |workspace, mut cx| async move {
+                cx.spawn_in(window, move |workspace, mut cx| async move {
                     let session = connect.await;
 
                     workspace
@@ -521,19 +505,20 @@ impl RemoteServerProjects {
 
                     let Some(Some(session)) = session else {
                         workspace
-                            .update(&mut cx, |workspace, cx| {
-                                let weak = cx.view().downgrade();
-                                workspace
-                                    .toggle_modal(cx, |cx| RemoteServerProjects::new(cx, weak));
+                            .update_in(&mut cx, |workspace, window, cx| {
+                                let weak = cx.entity().downgrade();
+                                workspace.toggle_modal(window, cx, |window, cx| {
+                                    RemoteServerProjects::new(window, cx, weak)
+                                });
                             })
                             .log_err();
                         return;
                     };
 
                     workspace
-                        .update(&mut cx, |workspace, cx| {
+                        .update_in(&mut cx, |workspace, window, cx| {
                             let app_state = workspace.app_state().clone();
-                            let weak = cx.view().downgrade();
+                            let weak = cx.entity().downgrade();
                             let project = project::Project::ssh(
                                 session,
                                 app_state.client.clone(),
@@ -543,11 +528,12 @@ impl RemoteServerProjects {
                                 app_state.fs.clone(),
                                 cx,
                             );
-                            workspace.toggle_modal(cx, |cx| {
+                            workspace.toggle_modal(window, cx, |window, cx| {
                                 RemoteServerProjects::project_picker(
                                     ix,
                                     connection_options,
                                     project,
+                                    window,
                                     cx,
                                     weak,
                                 )
@@ -560,23 +546,19 @@ impl RemoteServerProjects {
         })
     }
 
-    fn confirm(&mut self, _: &menu::Confirm, cx: &mut ViewContext<Self>) {
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         match &self.mode {
-            Mode::Default(_) | Mode::ViewServerOptions(_, _) => {
-                let items = std::mem::take(&mut self.selectable_items);
-                items.confirm(self, cx);
-                self.selectable_items = items;
-            }
+            Mode::Default(_) | Mode::ViewServerOptions(_) => {}
             Mode::ProjectPicker(_) => {}
             Mode::CreateRemoteServer(state) => {
                 if let Some(prompt) = state.ssh_prompt.as_ref() {
                     prompt.update(cx, |prompt, cx| {
-                        prompt.confirm(cx);
+                        prompt.confirm(window, cx);
                     });
                     return;
                 }
 
-                self.create_ssh_server(state.address_editor.clone(), cx);
+                self.create_ssh_server(state.address_editor.clone(), window, cx);
             }
             Mode::EditNickname(state) => {
                 let text = Some(state.editor.read(cx).text(cx)).filter(|text| !text.is_empty());
@@ -588,31 +570,28 @@ impl RemoteServerProjects {
                         }
                     }
                 });
-                self.mode = Mode::default_mode();
-                self.selectable_items.reset_selection();
-                self.focus_handle.focus(cx);
+                self.mode = Mode::default_mode(cx);
+                self.focus_handle.focus(window);
             }
         }
     }
 
-    fn cancel(&mut self, _: &menu::Cancel, cx: &mut ViewContext<Self>) {
+    fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         match &self.mode {
             Mode::Default(_) => cx.emit(DismissEvent),
             Mode::CreateRemoteServer(state) if state.ssh_prompt.is_some() => {
-                let new_state = CreateRemoteServer::new(cx);
+                let new_state = CreateRemoteServer::new(window, cx);
                 let old_prompt = state.address_editor.read(cx).text(cx);
                 new_state.address_editor.update(cx, |this, cx| {
-                    this.set_text(old_prompt, cx);
+                    this.set_text(old_prompt, window, cx);
                 });
 
                 self.mode = Mode::CreateRemoteServer(new_state);
-                self.selectable_items.reset_selection();
                 cx.notify();
             }
             _ => {
-                self.mode = Mode::default_mode();
-                self.selectable_items.reset_selection();
-                self.focus_handle(cx).focus(cx);
+                self.mode = Mode::default_mode(cx);
+                self.focus_handle(cx).focus(window);
                 cx.notify();
             }
         }
@@ -621,14 +600,16 @@ impl RemoteServerProjects {
     fn render_ssh_connection(
         &mut self,
         ix: usize,
-        ssh_connection: SshConnection,
-        cx: &mut ViewContext<Self>,
+        ssh_server: ProjectEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (main_label, aux_label) = if let Some(nickname) = ssh_connection.nickname.clone() {
-            let aux_label = SharedString::from(format!("({})", ssh_connection.host));
+        let (main_label, aux_label) = if let Some(nickname) = ssh_server.connection.nickname.clone()
+        {
+            let aux_label = SharedString::from(format!("({})", ssh_server.connection.host));
             (nickname.into(), Some(aux_label))
         } else {
-            (ssh_connection.host.clone(), None)
+            (ssh_server.connection.host.clone(), None)
         };
         v_flex()
             .w_full()
@@ -657,78 +638,116 @@ impl RemoteServerProjects {
             .child(
                 List::new()
                     .empty_message("No projects.")
-                    .children(ssh_connection.projects.iter().enumerate().map(|(pix, p)| {
+                    .children(ssh_server.projects.iter().enumerate().map(|(pix, p)| {
                         v_flex().gap_0p5().child(self.render_ssh_project(
                             ix,
-                            &ssh_connection,
+                            &ssh_server,
                             pix,
                             p,
+                            window,
                             cx,
                         ))
                     }))
-                    .child(h_flex().map(|this| {
-                        self.selectable_items.add_item(Box::new({
-                            let ssh_connection = ssh_connection.clone();
-                            move |this, cx| {
-                                this.create_ssh_project(ix, ssh_connection.clone(), cx);
-                            }
-                        }));
-                        let is_selected = self.selectable_items.is_selected();
-                        this.child(
-                            ListItem::new(("new-remote-project", ix))
-                                .selected(is_selected)
-                                .inset(true)
-                                .spacing(ui::ListItemSpacing::Sparse)
-                                .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
-                                .child(Label::new("Open Folder"))
-                                .on_click(cx.listener({
-                                    let ssh_connection = ssh_connection.clone();
-                                    move |this, _, cx| {
-                                        this.create_ssh_project(ix, ssh_connection.clone(), cx);
-                                    }
-                                })),
-                        )
-                    }))
-                    .child(h_flex().map(|this| {
-                        self.selectable_items.add_item(Box::new({
-                            let ssh_connection = ssh_connection.clone();
-                            move |this, cx| {
-                                this.view_server_options((ix, ssh_connection.clone()), cx);
-                            }
-                        }));
-                        let is_selected = self.selectable_items.is_selected();
-                        this.child(
-                            ListItem::new(("server-options", ix))
-                                .selected(is_selected)
-                                .inset(true)
-                                .spacing(ui::ListItemSpacing::Sparse)
-                                .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
-                                .child(Label::new("View Server Options"))
-                                .on_click(cx.listener({
-                                    let ssh_connection = ssh_connection.clone();
-                                    move |this, _, cx| {
-                                        this.view_server_options((ix, ssh_connection.clone()), cx);
-                                    }
-                                })),
-                        )
-                    })),
+                    .child(
+                        h_flex()
+                            .id(("new-remote-project-container", ix))
+                            .track_focus(&ssh_server.open_folder.focus_handle)
+                            .anchor_scroll(ssh_server.open_folder.scroll_anchor.clone())
+                            .on_action(cx.listener({
+                                let ssh_connection = ssh_server.clone();
+                                move |this, _: &menu::Confirm, window, cx| {
+                                    this.create_ssh_project(
+                                        ix,
+                                        ssh_connection.connection.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }))
+                            .child(
+                                ListItem::new(("new-remote-project", ix))
+                                    .toggle_state(
+                                        ssh_server
+                                            .open_folder
+                                            .focus_handle
+                                            .contains_focused(window, cx),
+                                    )
+                                    .inset(true)
+                                    .spacing(ui::ListItemSpacing::Sparse)
+                                    .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
+                                    .child(Label::new("Open Folder"))
+                                    .on_click(cx.listener({
+                                        let ssh_connection = ssh_server.clone();
+                                        move |this, _, window, cx| {
+                                            this.create_ssh_project(
+                                                ix,
+                                                ssh_connection.connection.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .id(("server-options-container", ix))
+                            .track_focus(&ssh_server.configure.focus_handle)
+                            .anchor_scroll(ssh_server.configure.scroll_anchor.clone())
+                            .on_action(cx.listener({
+                                let ssh_connection = ssh_server.clone();
+                                move |this, _: &menu::Confirm, window, cx| {
+                                    this.view_server_options(
+                                        (ix, ssh_connection.connection.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }))
+                            .child(
+                                ListItem::new(("server-options", ix))
+                                    .toggle_state(
+                                        ssh_server
+                                            .configure
+                                            .focus_handle
+                                            .contains_focused(window, cx),
+                                    )
+                                    .inset(true)
+                                    .spacing(ui::ListItemSpacing::Sparse)
+                                    .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
+                                    .child(Label::new("View Server Options"))
+                                    .on_click(cx.listener({
+                                        let ssh_connection = ssh_server.clone();
+                                        move |this, _, window, cx| {
+                                            this.view_server_options(
+                                                (ix, ssh_connection.connection.clone()),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            ),
+                    ),
             )
     }
 
     fn render_ssh_project(
         &mut self,
         server_ix: usize,
-        server: &SshConnection,
+        server: &ProjectEntry,
         ix: usize,
-        project: &SshProject,
-        cx: &ViewContext<Self>,
+        (navigation, project): &(NavigableEntry, SshProject),
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let server = server.clone();
-
         let element_id_base = SharedString::from(format!("remote-project-{server_ix}"));
+        let container_element_id_base =
+            SharedString::from(format!("remote-project-container-{element_id_base}"));
+
         let callback = Arc::new({
             let project = project.clone();
-            move |this: &mut Self, cx: &mut ViewContext<Self>| {
+            move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
                 let Some(app_state) = this
                     .workspace
                     .update(cx, |workspace, _| workspace.app_state().clone())
@@ -737,8 +756,9 @@ impl RemoteServerProjects {
                     return;
                 };
                 let project = project.clone();
-                let server = server.clone();
-                cx.spawn(|remote_server_projects, mut cx| async move {
+                let server = server.connection.clone();
+                cx.emit(DismissEvent);
+                cx.spawn_in(window, |_, mut cx| async move {
                     let result = open_ssh_project(
                         server.into(),
                         project.paths.into_iter().map(PathBuf::from).collect(),
@@ -757,54 +777,58 @@ impl RemoteServerProjects {
                         )
                         .await
                         .ok();
-                    } else {
-                        remote_server_projects
-                            .update(&mut cx, |_, cx| cx.emit(DismissEvent))
-                            .ok();
                     }
                 })
                 .detach();
             }
         });
-        self.selectable_items.add_item(Box::new({
-            let callback = callback.clone();
-            move |this, cx| callback(this, cx)
-        }));
-        let is_selected = self.selectable_items.is_selected();
 
-        ListItem::new((element_id_base, ix))
-            .inset(true)
-            .selected(is_selected)
-            .spacing(ui::ListItemSpacing::Sparse)
-            .start_slot(
-                Icon::new(IconName::Folder)
-                    .color(Color::Muted)
-                    .size(IconSize::Small),
-            )
-            .child(Label::new(project.paths.join(", ")))
-            .on_click(cx.listener(move |this, _, cx| callback(this, cx)))
-            .end_hover_slot::<AnyElement>(Some(
-                div()
-                    .mr_2()
-                    .child(
-                        // Right-margin to offset it from the Scrollbar
-                        IconButton::new("remove-remote-project", IconName::TrashAlt)
-                            .icon_size(IconSize::Small)
-                            .shape(IconButtonShape::Square)
-                            .size(ButtonSize::Large)
-                            .tooltip(|cx| Tooltip::text("Delete Remote Project", cx))
-                            .on_click(cx.listener(move |this, _, cx| {
-                                this.delete_ssh_project(server_ix, ix, cx)
-                            })),
+        div()
+            .id((container_element_id_base, ix))
+            .track_focus(&navigation.focus_handle)
+            .anchor_scroll(navigation.scroll_anchor.clone())
+            .on_action(cx.listener({
+                let callback = callback.clone();
+                move |this, _: &menu::Confirm, window, cx| {
+                    callback(this, window, cx);
+                }
+            }))
+            .child(
+                ListItem::new((element_id_base, ix))
+                    .toggle_state(navigation.focus_handle.contains_focused(window, cx))
+                    .inset(true)
+                    .spacing(ui::ListItemSpacing::Sparse)
+                    .start_slot(
+                        Icon::new(IconName::Folder)
+                            .color(Color::Muted)
+                            .size(IconSize::Small),
                     )
-                    .into_any_element(),
-            ))
+                    .child(Label::new(project.paths.join(", ")))
+                    .on_click(cx.listener(move |this, _, window, cx| callback(this, window, cx)))
+                    .end_hover_slot::<AnyElement>(Some(
+                        div()
+                            .mr_2()
+                            .child({
+                                let project = project.clone();
+                                // Right-margin to offset it from the Scrollbar
+                                IconButton::new("remove-remote-project", IconName::TrashAlt)
+                                    .icon_size(IconSize::Small)
+                                    .shape(IconButtonShape::Square)
+                                    .size(ButtonSize::Large)
+                                    .tooltip(Tooltip::text("Delete Remote Project"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.delete_ssh_project(server_ix, &project, cx)
+                                    }))
+                            })
+                            .into_any_element(),
+                    )),
+            )
     }
 
     fn update_settings_file(
         &mut self,
-        cx: &mut ViewContext<Self>,
-        f: impl FnOnce(&mut RemoteSettingsContent, &AppContext) + Send + Sync + 'static,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut RemoteSettingsContent, &App) + Send + Sync + 'static,
     ) {
         let Some(fs) = self
             .workspace
@@ -816,7 +840,7 @@ impl RemoteServerProjects {
         update_settings_file::<SshSettings>(fs, cx, move |setting, cx| f(setting, cx));
     }
 
-    fn delete_ssh_server(&mut self, server: usize, cx: &mut ViewContext<Self>) {
+    fn delete_ssh_server(&mut self, server: usize, cx: &mut Context<Self>) {
         self.update_settings_file(cx, move |setting, _| {
             if let Some(connections) = setting.ssh_connections.as_mut() {
                 connections.remove(server);
@@ -824,14 +848,15 @@ impl RemoteServerProjects {
         });
     }
 
-    fn delete_ssh_project(&mut self, server: usize, project: usize, cx: &mut ViewContext<Self>) {
+    fn delete_ssh_project(&mut self, server: usize, project: &SshProject, cx: &mut Context<Self>) {
+        let project = project.clone();
         self.update_settings_file(cx, move |setting, _| {
             if let Some(server) = setting
                 .ssh_connections
                 .as_mut()
                 .and_then(|connections| connections.get_mut(server))
             {
-                server.projects.remove(project);
+                server.projects.remove(&project);
             }
         });
     }
@@ -839,7 +864,7 @@ impl RemoteServerProjects {
     fn add_ssh_server(
         &mut self,
         connection_options: remote::SshConnectionOptions,
-        cx: &mut ViewContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.update_settings_file(cx, move |setting, _| {
             setting
@@ -849,7 +874,7 @@ impl RemoteServerProjects {
                     host: SharedString::from(connection_options.host),
                     username: connection_options.username,
                     port: connection_options.port,
-                    projects: vec![],
+                    projects: BTreeSet::<SshProject>::new(),
                     nickname: None,
                     args: connection_options.args.unwrap_or_default(),
                     upload_binary_over_ssh: None,
@@ -860,7 +885,7 @@ impl RemoteServerProjects {
     fn render_create_remote_server(
         &self,
         state: &CreateRemoteServer,
-        cx: &mut ViewContext<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let ssh_prompt = state.ssh_prompt.clone();
 
@@ -873,6 +898,7 @@ impl RemoteServerProjects {
         let theme = cx.theme();
 
         v_flex()
+            .track_focus(&self.focus_handle(cx))
             .id("create-remote-server")
             .overflow_hidden()
             .size_full()
@@ -919,7 +945,7 @@ impl RemoteServerProjects {
                                             .size(ButtonSize::None)
                                             .color(Color::Accent)
                                             .style(ButtonStyle::Transparent)
-                                            .on_click(|_, cx| {
+                                            .on_click(|_, _, cx| {
                                                 cx.open_url(
                                                     "https://zed.dev/docs/remote-development",
                                                 );
@@ -933,210 +959,278 @@ impl RemoteServerProjects {
 
     fn render_view_options(
         &mut self,
-        index: usize,
-        connection: SshConnection,
-        cx: &mut ViewContext<Self>,
+        ViewServerOptionsState {
+            server_index,
+            connection,
+            entries,
+        }: ViewServerOptionsState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let connection_string = connection.host.clone();
 
-        div()
-            .size_full()
-            .child(
-                SshConnectionHeader {
-                    connection_string: connection_string.clone(),
-                    paths: Default::default(),
-                    nickname: connection.nickname.clone().map(|s| s.into()),
-                }
-                .render(cx),
-            )
-            .child(
-                v_flex()
-                    .pb_1()
-                    .child(ListSeparator)
-                    .child({
-                        self.selectable_items.add_item(Box::new({
-                            move |this, cx| {
-                                this.mode = Mode::EditNickname(EditNicknameState::new(index, cx));
-                                cx.notify();
-                            }
-                        }));
-                        let is_selected = self.selectable_items.is_selected();
-                        let label = if connection.nickname.is_some() {
-                            "Edit Nickname"
-                        } else {
-                            "Add Nickname to Server"
-                        };
-                        ListItem::new("add-nickname")
-                            .selected(is_selected)
-                            .inset(true)
-                            .spacing(ui::ListItemSpacing::Sparse)
-                            .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
-                            .child(Label::new(label))
-                            .on_click(cx.listener(move |this, _, cx| {
-                                this.mode = Mode::EditNickname(EditNicknameState::new(index, cx));
-                                cx.notify();
-                            }))
-                    })
-                    .child({
-                        let workspace = self.workspace.clone();
-                        fn callback(
-                            workspace: WeakView<Workspace>,
-                            connection_string: SharedString,
-                            cx: &mut WindowContext<'_>,
-                        ) {
-                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                connection_string.to_string(),
-                            ));
-                            workspace
-                                .update(cx, |this, cx| {
-                                    struct SshServerAddressCopiedToClipboard;
-                                    let notification = format!(
-                                        "Copied server address ({}) to clipboard",
-                                        connection_string
-                                    );
-
-                                    this.show_toast(
-                                        Toast::new(
-                                            NotificationId::composite::<
-                                                SshServerAddressCopiedToClipboard,
-                                            >(
-                                                connection_string.clone()
-                                            ),
-                                            notification,
+        let mut view = Navigable::new(
+            div()
+                .track_focus(&self.focus_handle(cx))
+                .size_full()
+                .child(
+                    SshConnectionHeader {
+                        connection_string: connection_string.clone(),
+                        paths: Default::default(),
+                        nickname: connection.nickname.clone().map(|s| s.into()),
+                    }
+                    .render(window, cx),
+                )
+                .child(
+                    v_flex()
+                        .pb_1()
+                        .child(ListSeparator)
+                        .child({
+                            let label = if connection.nickname.is_some() {
+                                "Edit Nickname"
+                            } else {
+                                "Add Nickname to Server"
+                            };
+                            div()
+                                .id("ssh-options-add-nickname")
+                                .track_focus(&entries[0].focus_handle)
+                                .on_action(cx.listener(
+                                    move |this, _: &menu::Confirm, window, cx| {
+                                        this.mode = Mode::EditNickname(EditNicknameState::new(
+                                            server_index,
+                                            window,
+                                            cx,
+                                        ));
+                                        cx.notify();
+                                    },
+                                ))
+                                .child(
+                                    ListItem::new("add-nickname")
+                                        .toggle_state(
+                                            entries[0].focus_handle.contains_focused(window, cx),
                                         )
-                                        .autohide(),
-                                        cx,
-                                    );
-                                })
-                                .ok();
-                        }
-                        self.selectable_items.add_item(Box::new({
-                            let workspace = workspace.clone();
-                            let connection_string = connection_string.clone();
-                            move |_, cx| {
-                                callback(workspace.clone(), connection_string.clone(), cx);
-                            }
-                        }));
-                        let is_selected = self.selectable_items.is_selected();
-                        ListItem::new("copy-server-address")
-                            .selected(is_selected)
-                            .inset(true)
-                            .spacing(ui::ListItemSpacing::Sparse)
-                            .start_slot(Icon::new(IconName::Copy).color(Color::Muted))
-                            .child(Label::new("Copy Server Address"))
-                            .end_hover_slot(
-                                Label::new(connection_string.clone()).color(Color::Muted),
-                            )
-                            .on_click({
-                                let connection_string = connection_string.clone();
-                                move |_, cx| {
-                                    callback(workspace.clone(), connection_string.clone(), cx);
-                                }
-                            })
-                    })
-                    .child({
-                        fn remove_ssh_server(
-                            remote_servers: View<RemoteServerProjects>,
-                            index: usize,
-                            connection_string: SharedString,
-                            cx: &mut WindowContext<'_>,
-                        ) {
-                            let prompt_message = format!("Remove server `{}`?", connection_string);
-
-                            let confirmation = cx.prompt(
-                                PromptLevel::Warning,
-                                &prompt_message,
-                                None,
-                                &["Yes, remove it", "No, keep it"],
-                            );
-
-                            cx.spawn(|mut cx| async move {
-                                if confirmation.await.ok() == Some(0) {
-                                    remote_servers
-                                        .update(&mut cx, |this, cx| {
-                                            this.delete_ssh_server(index, cx);
-                                            this.mode = Mode::default_mode();
+                                        .inset(true)
+                                        .spacing(ui::ListItemSpacing::Sparse)
+                                        .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                                        .child(Label::new(label))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.mode = Mode::EditNickname(EditNicknameState::new(
+                                                server_index,
+                                                window,
+                                                cx,
+                                            ));
                                             cx.notify();
-                                        })
-                                        .ok();
-                                }
-                                anyhow::Ok(())
-                            })
-                            .detach_and_log_err(cx);
-                        }
-                        self.selectable_items.add_item(Box::new({
-                            let connection_string = connection_string.clone();
-                            move |_, cx| {
-                                remove_ssh_server(
-                                    cx.view().clone(),
-                                    index,
-                                    connection_string.clone(),
+                                        })),
+                                )
+                        })
+                        .child({
+                            let workspace = self.workspace.clone();
+                            fn callback(
+                                workspace: WeakEntity<Workspace>,
+                                connection_string: SharedString,
+                                cx: &mut App,
+                            ) {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    connection_string.to_string(),
+                                ));
+                                workspace
+                                    .update(cx, |this, cx| {
+                                        struct SshServerAddressCopiedToClipboard;
+                                        let notification = format!(
+                                            "Copied server address ({}) to clipboard",
+                                            connection_string
+                                        );
+
+                                        this.show_toast(
+                                            Toast::new(
+                                                NotificationId::composite::<
+                                                    SshServerAddressCopiedToClipboard,
+                                                >(
+                                                    connection_string.clone()
+                                                ),
+                                                notification,
+                                            )
+                                            .autohide(),
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                            }
+                            div()
+                                .id("ssh-options-copy-server-address")
+                                .track_focus(&entries[1].focus_handle)
+                                .on_action({
+                                    let connection_string = connection_string.clone();
+                                    let workspace = self.workspace.clone();
+                                    move |_: &menu::Confirm, _, cx| {
+                                        callback(workspace.clone(), connection_string.clone(), cx);
+                                    }
+                                })
+                                .child(
+                                    ListItem::new("copy-server-address")
+                                        .toggle_state(
+                                            entries[1].focus_handle.contains_focused(window, cx),
+                                        )
+                                        .inset(true)
+                                        .spacing(ui::ListItemSpacing::Sparse)
+                                        .start_slot(Icon::new(IconName::Copy).color(Color::Muted))
+                                        .child(Label::new("Copy Server Address"))
+                                        .end_hover_slot(
+                                            Label::new(connection_string.clone())
+                                                .color(Color::Muted),
+                                        )
+                                        .on_click({
+                                            let connection_string = connection_string.clone();
+                                            move |_, _, cx| {
+                                                callback(
+                                                    workspace.clone(),
+                                                    connection_string.clone(),
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                )
+                        })
+                        .child({
+                            fn remove_ssh_server(
+                                remote_servers: Entity<RemoteServerProjects>,
+                                index: usize,
+                                connection_string: SharedString,
+                                window: &mut Window,
+                                cx: &mut App,
+                            ) {
+                                let prompt_message =
+                                    format!("Remove server `{}`?", connection_string);
+
+                                let confirmation = window.prompt(
+                                    PromptLevel::Warning,
+                                    &prompt_message,
+                                    None,
+                                    &["Yes, remove it", "No, keep it"],
                                     cx,
                                 );
+
+                                cx.spawn(|mut cx| async move {
+                                    if confirmation.await.ok() == Some(0) {
+                                        remote_servers
+                                            .update(&mut cx, |this, cx| {
+                                                this.delete_ssh_server(index, cx);
+                                            })
+                                            .ok();
+                                        remote_servers
+                                            .update(&mut cx, |this, cx| {
+                                                this.mode = Mode::default_mode(cx);
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    }
+                                    anyhow::Ok(())
+                                })
+                                .detach_and_log_err(cx);
                             }
-                        }));
-                        let is_selected = self.selectable_items.is_selected();
-                        ListItem::new("remove-server")
-                            .selected(is_selected)
-                            .inset(true)
-                            .spacing(ui::ListItemSpacing::Sparse)
-                            .start_slot(Icon::new(IconName::Trash).color(Color::Error))
-                            .child(Label::new("Remove Server").color(Color::Error))
-                            .on_click(cx.listener(move |_, _, cx| {
-                                remove_ssh_server(
-                                    cx.view().clone(),
-                                    index,
-                                    connection_string.clone(),
-                                    cx,
-                                );
-                            }))
-                    })
-                    .child(ListSeparator)
-                    .child({
-                        self.selectable_items.add_item(Box::new({
-                            move |this, cx| {
-                                this.mode = Mode::default_mode();
-                                cx.notify();
-                            }
-                        }));
-                        let is_selected = self.selectable_items.is_selected();
-                        ListItem::new("go-back")
-                            .selected(is_selected)
-                            .inset(true)
-                            .spacing(ui::ListItemSpacing::Sparse)
-                            .start_slot(Icon::new(IconName::ArrowLeft).color(Color::Muted))
-                            .child(Label::new("Go Back"))
-                            .on_click(cx.listener(|this, _, cx| {
-                                this.mode = Mode::default_mode();
-                                cx.notify()
-                            }))
-                    }),
-            )
+                            div()
+                                .id("ssh-options-copy-server-address")
+                                .track_focus(&entries[2].focus_handle)
+                                .on_action(cx.listener({
+                                    let connection_string = connection_string.clone();
+                                    move |_, _: &menu::Confirm, window, cx| {
+                                        remove_ssh_server(
+                                            cx.entity().clone(),
+                                            server_index,
+                                            connection_string.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                        cx.focus_self(window);
+                                    }
+                                }))
+                                .child(
+                                    ListItem::new("remove-server")
+                                        .toggle_state(
+                                            entries[2].focus_handle.contains_focused(window, cx),
+                                        )
+                                        .inset(true)
+                                        .spacing(ui::ListItemSpacing::Sparse)
+                                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                                        .child(Label::new("Remove Server").color(Color::Error))
+                                        .on_click(cx.listener(move |_, _, window, cx| {
+                                            remove_ssh_server(
+                                                cx.entity().clone(),
+                                                server_index,
+                                                connection_string.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                            cx.focus_self(window);
+                                        })),
+                                )
+                        })
+                        .child(ListSeparator)
+                        .child({
+                            div()
+                                .id("ssh-options-copy-server-address")
+                                .track_focus(&entries[3].focus_handle)
+                                .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                                    this.mode = Mode::default_mode(cx);
+                                    cx.focus_self(window);
+                                    cx.notify();
+                                }))
+                                .child(
+                                    ListItem::new("go-back")
+                                        .toggle_state(
+                                            entries[3].focus_handle.contains_focused(window, cx),
+                                        )
+                                        .inset(true)
+                                        .spacing(ui::ListItemSpacing::Sparse)
+                                        .start_slot(
+                                            Icon::new(IconName::ArrowLeft).color(Color::Muted),
+                                        )
+                                        .child(Label::new("Go Back"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.mode = Mode::default_mode(cx);
+                                            cx.focus_self(window);
+                                            cx.notify()
+                                        })),
+                                )
+                        }),
+                )
+                .into_any_element(),
+        );
+        for entry in entries {
+            view = view.entry(entry);
+        }
+
+        view.render(window, cx).into_any_element()
     }
 
     fn render_edit_nickname(
         &self,
         state: &EditNicknameState,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let Some(connection) = SshSettings::get_global(cx)
             .ssh_connections()
             .nth(state.index)
         else {
-            return v_flex();
+            return v_flex()
+                .id("ssh-edit-nickname")
+                .track_focus(&self.focus_handle(cx));
         };
 
         let connection_string = connection.host.clone();
         let nickname = connection.nickname.clone().map(|s| s.into());
 
         v_flex()
+            .id("ssh-edit-nickname")
+            .track_focus(&self.focus_handle(cx))
             .child(
                 SshConnectionHeader {
                     connection_string,
                     paths: Default::default(),
                     nickname,
                 }
-                .render(cx),
+                .render(window, cx),
             )
             .child(
                 h_flex()
@@ -1149,65 +1243,108 @@ impl RemoteServerProjects {
 
     fn render_default(
         &mut self,
-        scroll_state: ScrollbarState,
-        cx: &mut ViewContext<Self>,
+        mut state: DefaultState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let scroll_state = scroll_state.parent_view(cx.view());
-        let ssh_connections = SshSettings::get_global(cx)
-            .ssh_connections()
-            .collect::<Vec<_>>();
-        self.selectable_items.add_item(Box::new(|this, cx| {
-            this.mode = Mode::CreateRemoteServer(CreateRemoteServer::new(cx));
-            cx.notify();
-        }));
+        if SshSettings::get_global(cx)
+            .ssh_connections
+            .as_ref()
+            .map_or(false, |connections| {
+                state
+                    .servers
+                    .iter()
+                    .map(|server| &server.connection)
+                    .ne(connections.iter())
+            })
+        {
+            self.mode = Mode::default_mode(cx);
+            if let Mode::Default(new_state) = &self.mode {
+                state = new_state.clone();
+            }
+        }
+        let scroll_state = state.scrollbar.parent_entity(&cx.entity());
+        let connect_button = div()
+            .id("ssh-connect-new-server-container")
+            .track_focus(&state.add_new_server.focus_handle)
+            .anchor_scroll(state.add_new_server.scroll_anchor.clone())
+            .child(
+                ListItem::new("register-remove-server-button")
+                    .toggle_state(
+                        state
+                            .add_new_server
+                            .focus_handle
+                            .contains_focused(window, cx),
+                    )
+                    .inset(true)
+                    .spacing(ui::ListItemSpacing::Sparse)
+                    .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
+                    .child(Label::new("Connect New Server"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let state = CreateRemoteServer::new(window, cx);
+                        this.mode = Mode::CreateRemoteServer(state);
 
-        let is_selected = self.selectable_items.is_selected();
-
-        let connect_button = ListItem::new("register-remove-server-button")
-            .selected(is_selected)
-            .inset(true)
-            .spacing(ui::ListItemSpacing::Sparse)
-            .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
-            .child(Label::new("Connect New Server"))
-            .on_click(cx.listener(|this, _, cx| {
-                let state = CreateRemoteServer::new(cx);
+                        cx.notify();
+                    })),
+            )
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                let state = CreateRemoteServer::new(window, cx);
                 this.mode = Mode::CreateRemoteServer(state);
 
                 cx.notify();
             }));
 
-        let ui::ScrollableHandle::NonUniform(scroll_handle) = scroll_state.scroll_handle() else {
+        let Some(scroll_handle) = scroll_state
+            .scroll_handle()
+            .as_any()
+            .downcast_ref::<ScrollHandle>()
+        else {
             unreachable!()
         };
 
-        let mut modal_section = v_flex()
-            .id("ssh-server-list")
-            .overflow_y_scroll()
-            .track_scroll(&scroll_handle)
-            .size_full()
-            .child(connect_button)
-            .child(
-                List::new()
-                    .empty_message(
-                        v_flex()
-                            .child(div().px_3().child(
-                                Label::new("No remote servers registered yet.").color(Color::Muted),
-                            ))
-                            .into_any_element(),
-                    )
-                    .children(ssh_connections.iter().cloned().enumerate().map(
-                        |(ix, connection)| {
-                            self.render_ssh_connection(ix, connection, cx)
+        let mut modal_section = Navigable::new(
+            v_flex()
+                .track_focus(&self.focus_handle(cx))
+                .id("ssh-server-list")
+                .overflow_y_scroll()
+                .track_scroll(&scroll_handle)
+                .size_full()
+                .child(connect_button)
+                .child(
+                    List::new()
+                        .empty_message(
+                            v_flex()
+                                .child(
+                                    div().px_3().child(
+                                        Label::new("No remote servers registered yet.")
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                                .into_any_element(),
+                        )
+                        .children(state.servers.iter().enumerate().map(|(ix, connection)| {
+                            self.render_ssh_connection(ix, connection.clone(), window, cx)
                                 .into_any_element()
-                        },
-                    )),
-            )
-            .into_any_element();
+                        })),
+                )
+                .into_any_element(),
+        )
+        .entry(state.add_new_server.clone());
 
-        Modal::new("remote-projects", Some(self.scroll_handle.clone()))
+        for server in &state.servers {
+            for (navigation_state, _) in &server.projects {
+                modal_section = modal_section.entry(navigation_state.clone());
+            }
+            modal_section = modal_section
+                .entry(server.open_folder.clone())
+                .entry(server.configure.clone());
+        }
+        let mut modal_section = modal_section.render(window, cx).into_any_element();
+
+        Modal::new("remote-projects", None)
             .header(
                 ModalHeader::new()
-                    .child(Headline::new("Remote Projects (alpha)").size(HeadlineSize::XSmall)),
+                    .child(Headline::new("Remote Projects (beta)").size(HeadlineSize::XSmall)),
             )
             .section(
                 Section::new().padded(false).child(
@@ -1218,16 +1355,17 @@ impl RemoteServerProjects {
                         .child(ListSeparator)
                         .child(
                             canvas(
-                                |bounds, cx| {
+                                |bounds, window, cx| {
                                     modal_section.prepaint_as_root(
                                         bounds.origin,
                                         bounds.size.into(),
+                                        window,
                                         cx,
                                     );
                                     modal_section
                                 },
-                                |_, mut modal_section, cx| {
-                                    modal_section.paint(cx);
+                                |_, mut modal_section, window, cx| {
+                                    modal_section.paint(window, cx);
                                 },
                             )
                             .size_full(),
@@ -1245,17 +1383,18 @@ impl RemoteServerProjects {
                         ),
                 ),
             )
+            .into_any_element()
     }
 }
 
-fn get_text(element: &View<Editor>, cx: &mut WindowContext) -> String {
+fn get_text(element: &Entity<Editor>, cx: &mut App) -> String {
     element.read(cx).text(cx).trim().to_string()
 }
 
 impl ModalView for RemoteServerProjects {}
 
-impl FocusableView for RemoteServerProjects {
-    fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
+impl Focusable for RemoteServerProjects {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.mode {
             Mode::ProjectPicker(picker) => picker.focus_handle(cx),
             _ => self.focus_handle.clone(),
@@ -1266,37 +1405,35 @@ impl FocusableView for RemoteServerProjects {
 impl EventEmitter<DismissEvent> for RemoteServerProjects {}
 
 impl Render for RemoteServerProjects {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        self.selectable_items.reset();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .track_focus(&self.focus_handle)
             .elevation_3(cx)
             .w(rems(34.))
             .key_context("RemoteServerModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
-            .on_action(cx.listener(Self::prev_item))
-            .on_action(cx.listener(Self::next_item))
-            .capture_any_mouse_down(cx.listener(|this, _, cx| {
-                this.focus_handle(cx).focus(cx);
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                this.focus_handle(cx).focus(window);
             }))
-            .on_mouse_down_out(cx.listener(|this, _, cx| {
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 if matches!(this.mode, Mode::Default(_)) {
                     cx.emit(DismissEvent)
                 }
             }))
             .child(match &self.mode {
-                Mode::Default(state) => self.render_default(state.clone(), cx).into_any_element(),
-                Mode::ViewServerOptions(index, connection) => self
-                    .render_view_options(*index, connection.clone(), cx)
+                Mode::Default(state) => self
+                    .render_default(state.clone(), window, cx)
+                    .into_any_element(),
+                Mode::ViewServerOptions(state) => self
+                    .render_view_options(state.clone(), window, cx)
                     .into_any_element(),
                 Mode::ProjectPicker(element) => element.clone().into_any_element(),
                 Mode::CreateRemoteServer(state) => self
                     .render_create_remote_server(state, cx)
                     .into_any_element(),
-                Mode::EditNickname(state) => {
-                    self.render_edit_nickname(state, cx).into_any_element()
-                }
+                Mode::EditNickname(state) => self
+                    .render_edit_nickname(state, window, cx)
+                    .into_any_element(),
             })
     }
 }
