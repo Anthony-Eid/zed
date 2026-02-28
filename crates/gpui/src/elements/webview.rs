@@ -5,10 +5,12 @@ use crate::{
 use refineable::Refineable;
 
 /// Construct an embedded platform webview element.
+#[track_caller]
 pub fn webview(url: impl Into<String>) -> Webview {
     Webview {
         url: url.into(),
         visible: true,
+        element_id: ElementId::CodeLocation(*core::panic::Location::caller()),
         style: StyleRefinement::default(),
     }
 }
@@ -17,6 +19,7 @@ pub fn webview(url: impl Into<String>) -> Webview {
 pub struct Webview {
     url: String,
     visible: bool,
+    element_id: ElementId,
     style: StyleRefinement,
 }
 
@@ -30,6 +33,17 @@ impl Webview {
     /// Replace the current URL.
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = url.into();
+        self
+    }
+
+    /// Set an explicit element ID for this webview.
+    ///
+    /// By default the element ID is derived from the call site via
+    /// `#[track_caller]`. Providing a stable ID is recommended when
+    /// the webview is constructed inside a loop or from a dynamic
+    /// call site so that the native webview survives across frames.
+    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.element_id = id.into();
         self
     }
 }
@@ -55,8 +69,7 @@ impl Element for Webview {
     type PrepaintState = WebviewState;
 
     fn id(&self) -> Option<ElementId> {
-        // Ensure this element always receives a global id and therefore stable element state.
-        Some(ElementId::CodeLocation(*core::panic::Location::caller()))
+        Some(self.element_id.clone())
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {

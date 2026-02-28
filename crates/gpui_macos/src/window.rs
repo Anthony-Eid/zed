@@ -408,7 +408,7 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
-    webviews: FxHashMap<u64, id>,
+    webviews: FxHashMap<u64, (id, String)>,
     background_appearance: WindowBackgroundAppearance,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
@@ -443,9 +443,9 @@ struct MacWindowState {
 }
 
 impl MacWindowState {
-    fn ensure_webview_for_id(&mut self, id: u64, frame: NSRect) -> Option<id> {
-        if let Some(webview) = self.webviews.get(&id).copied() {
-            return Some(webview);
+    fn ensure_webview_for_id(&mut self, id: u64, frame: NSRect) -> Option<(id, bool)> {
+        if let Some((webview, _)) = self.webviews.get(&id) {
+            return Some((*webview, false));
         }
 
         let content_view = unsafe { self.native_window.contentView() };
@@ -463,24 +463,39 @@ impl MacWindowState {
             ];
         }
 
-        self.webviews.insert(id, webview);
-        Some(webview)
+        self.webviews.insert(id, (webview, String::new()));
+        Some((webview, true))
     }
 
     fn destroy_webview_for_id(&mut self, id: u64) {
-        if let Some(webview) = self.webviews.remove(&id) {
+        if let Some((webview, _)) = self.webviews.remove(&id) {
+            unsafe {
+                webview::remove_from_superview(webview);
+                webview::release(webview);
+            }
+            self.restore_native_view_first_responder();
+        }
+    }
+
+    fn destroy_all_webviews(&mut self) {
+        let had_webviews = !self.webviews.is_empty();
+        for (_, (webview, _)) in self.webviews.drain() {
             unsafe {
                 webview::remove_from_superview(webview);
                 webview::release(webview);
             }
         }
+        if had_webviews {
+            self.restore_native_view_first_responder();
+        }
     }
 
-    fn destroy_all_webviews(&mut self) {
-        for (_, webview) in self.webviews.drain() {
-            unsafe {
-                webview::remove_from_superview(webview);
-                webview::release(webview);
+    fn restore_native_view_first_responder(&self) {
+        unsafe {
+            let current_responder: id = msg_send![self.native_window, firstResponder];
+            let native_view = self.native_view.as_ptr();
+            if current_responder != native_view as id {
+                let _: () = msg_send![self.native_window, makeFirstResponder: native_view];
             }
         }
     }
@@ -859,7 +874,7 @@ impl MacWindow {
                 && let Some(frame) = experimental_webview_right_half_frame(content_view)
             {
                 let mut window_state = window.0.lock();
-                if let Some(webview) = window_state.ensure_webview_for_id(0, frame) {
+                if let Some((webview, _)) = window_state.ensure_webview_for_id(0, frame) {
                     let _loaded = webview::load_url(webview, "https://example.com");
                     webview::set_hidden(webview, false);
                     log::info!("experimental webview created and load requested");
@@ -881,6 +896,21 @@ impl MacWindow {
                         native_window.setLevel_(NSNormalWindowLevel);
                     }
                     native_window.setAcceptsMouseMovedEvents_(YES);
+
+                    // Use a tracking area so that mouseMoved: is delivered to the
+                    // native view even when a child view (e.g. WKWebView) is first
+                    // responder. Without this, embedded webviews steal mouseMoved:
+                    // and GPUI hit-testing / hover states break.
+                    let tracking_area: id = msg_send![class!(NSTrackingArea), alloc];
+                    let _: () = msg_send![
+                        tracking_area,
+                        initWithRect: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
+                        options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                        owner: native_view
+                        userInfo: nil
+                    ];
+                    let _: () =
+                        msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
 
                     if let Some(tabbing_identifier) = tabbing_identifier {
                         let tabbing_id = ns_string(tabbing_identifier.as_str());
@@ -1640,7 +1670,7 @@ impl PlatformWindow for MacWindow {
             ),
         );
 
-        let Some(webview) = lock.ensure_webview_for_id(0, frame) else {
+        let Some((webview, _)) = lock.ensure_webview_for_id(0, frame) else {
             return;
         };
 
@@ -1657,7 +1687,7 @@ impl PlatformWindow for MacWindow {
             return;
         };
 
-        let Some(webview) = lock.ensure_webview_for_id(0, frame) else {
+        let Some((webview, _)) = lock.ensure_webview_for_id(0, frame) else {
             return;
         };
 
@@ -1699,7 +1729,7 @@ impl PlatformWindow for MacWindow {
             ),
         );
 
-        let Some(webview) = lock.ensure_webview_for_id(id, frame) else {
+        let Some((webview, is_new)) = lock.ensure_webview_for_id(id, frame) else {
             return;
         };
 
@@ -1709,8 +1739,17 @@ impl PlatformWindow for MacWindow {
             webview::set_corner_radius(webview, corner_radius.as_f32() as f64);
         }
 
-        if visible {
+        let url_changed = lock
+            .webviews
+            .get(&id)
+            .map_or(true, |(_, loaded_url)| loaded_url != url);
+
+        if visible && (is_new || url_changed) {
             let _loaded = unsafe { webview::load_url(webview, url) };
+            if let Some((_, loaded_url)) = lock.webviews.get_mut(&id) {
+                loaded_url.clear();
+                loaded_url.push_str(url);
+            }
         }
     }
 
@@ -2101,6 +2140,13 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 
         match &event {
             PlatformInput::MouseDown(_) => {
+                // When a webview is embedded, clicking on the GPUI native view
+                // should reclaim first-responder so that key events and
+                // mouseMoved: flow back to GPUI.
+                if !lock.webviews.is_empty() {
+                    lock.restore_native_view_first_responder();
+                }
+
                 drop(lock);
                 unsafe {
                     let input_context: id = msg_send![this, inputContext];

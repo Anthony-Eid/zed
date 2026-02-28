@@ -747,6 +747,7 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
+    pub(crate) webview_ids: Vec<u64>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -764,6 +765,7 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
+    webview_ids_index: usize,
 }
 
 #[derive(Clone, Default)]
@@ -793,6 +795,7 @@ impl Frame {
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
+            webview_ids: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -818,6 +821,7 @@ impl Frame {
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
+        self.webview_ids.clear();
         self.tab_stops.clear();
         self.focus = None;
 
@@ -901,6 +905,8 @@ pub struct Window {
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
+    previous_frame_webview_ids: FxHashSet<u64>,
+    current_frame_webview_ids: FxHashSet<u64>,
     /// The stack of override values for the window's rem size.
     ///
     /// This is used by `with_rem_size` to allow rendering an element tree with
@@ -1394,6 +1400,8 @@ impl Window {
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
+            previous_frame_webview_ids: FxHashSet::default(),
+            current_frame_webview_ids: FxHashSet::default(),
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
@@ -2023,13 +2031,15 @@ impl Window {
 
     /// Creates or updates an embedded platform webview instance in this window.
     pub fn upsert_webview(
-        &self,
+        &mut self,
         id: u64,
         bounds: Bounds<Pixels>,
         url: &str,
         visible: bool,
         corner_radius: Pixels,
     ) {
+        self.current_frame_webview_ids.insert(id);
+        self.next_frame.webview_ids.push(id);
         self.platform_window
             .upsert_webview(id, bounds, url, visible, corner_radius);
     }
@@ -2260,6 +2270,16 @@ impl Window {
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
+
+        for stale_id in self
+            .previous_frame_webview_ids
+            .difference(&self.current_frame_webview_ids)
+            .copied()
+            .collect::<SmallVec<[u64; 4]>>()
+        {
+            self.platform_window.destroy_webview(stale_id);
+        }
+        self.previous_frame_webview_ids = mem::take(&mut self.current_frame_webview_ids);
 
         ArenaClearNeeded::new(&cx.element_arena)
     }
@@ -2516,6 +2536,7 @@ impl Window {
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
+            webview_ids_index: self.next_frame.webview_ids.len(),
         }
     }
 
@@ -2539,6 +2560,13 @@ impl Window {
         );
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+
+        for &webview_id in &self.rendered_frame.webview_ids
+            [range.start.webview_ids_index..range.end.webview_ids_index]
+        {
+            self.current_frame_webview_ids.insert(webview_id);
+            self.next_frame.webview_ids.push(webview_id);
+        }
 
         let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
             range.start.dispatch_tree_index..range.end.dispatch_tree_index,

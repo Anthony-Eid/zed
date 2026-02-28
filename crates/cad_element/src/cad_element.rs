@@ -89,6 +89,7 @@ pub struct CadViewer {
     status: ServerStatus,
     error_message: Option<SharedString>,
     port: u16,
+    active: bool,
     _start_task: Task<()>,
 }
 
@@ -129,6 +130,7 @@ impl CadViewer {
             status: ServerStatus::Starting,
             error_message: None,
             port,
+            active: true,
             _start_task: start_task,
         }
     }
@@ -208,9 +210,16 @@ impl CadViewer {
             .unwrap_or_else(|| format!("http://{}:{}", DEFAULT_HOST, self.port));
 
         div()
+            .id("cad-element-viewer")
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .child(webview(url).size_full().rounded_md())
+            .child(
+                webview(url)
+                    .id("cad-webview")
+                    .size_full()
+                    .rounded_md()
+                    .visible(self.active),
+            )
     }
 
     pub fn register(workspace: &mut Workspace, _window: &mut Window, _cx: &mut Context<Workspace>) {
@@ -223,6 +232,8 @@ impl CadViewer {
 
 impl Render for CadViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.active = true;
+
         let content = match self.status {
             ServerStatus::Starting => self.render_loading(cx).into_any_element(),
             ServerStatus::Failed => self.render_error(cx).into_any_element(),
@@ -269,6 +280,16 @@ impl Item for CadViewer {
     }
 
     fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(workspace::item::ItemEvent)) {}
+
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.active = false;
+        cx.notify();
+    }
+
+    fn workspace_deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.active = false;
+        cx.notify();
+    }
 
     fn show_toolbar(&self) -> bool {
         false
