@@ -58,3 +58,14 @@ pub(crate) unsafe fn remove_from_superview(webview: id) {
 
     let _: () = msg_send![webview, removeFromSuperview];
 }
+
+/// Shows or hides a `WKWebView`.
+#[allow(dead_code)]
+pub(crate) unsafe fn set_hidden(webview: id, hidden: bool) {
+    if webview == nil {
+        return;
+    }
+
+    let hidden_flag = if hidden { 1_i8 } else { 0_i8 };
+    let _: () = msg_send![webview, setHidden: hidden_flag];
+}

@@ -2021,6 +2021,18 @@ impl Window {
         self.platform_window.set_edited(edited);
     }
 
+    /// Sets the bounds of an embedded platform webview in this window.
+    ///
+    /// Passing `Some(bounds)` positions and sizes the webview. Passing `None` hides it.
+    pub fn set_webview_bounds(&self, bounds: Option<Bounds<Pixels>>) {
+        self.platform_window.set_webview_bounds(bounds);
+    }
+
+    /// Loads the given URL in the embedded platform webview in this window.
+    pub fn load_webview_url(&self, url: &str) {
+        self.platform_window.load_webview_url(url);
+    }
+
     /// Determine the display on which the window is visible.
     pub fn display(&self, cx: &App) -> Option<Rc<dyn PlatformDisplay>> {
         cx.platform

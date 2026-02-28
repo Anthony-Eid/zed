@@ -5,6 +5,7 @@
 Get **any embedded web content visible inside a GPUI window on macOS** as fast as possible, then iterate toward a reusable API for CAD preview workflows.
 
 Success criteria for phase 1:
+
 - Launch app
 - Show a GPUI window
 - Render a native `WKWebView` in that window
@@ -16,12 +17,14 @@ Success criteria for phase 1:
 ## Scope (intentionally narrow)
 
 ### In scope
+
 - macOS only
 - native `WKWebView` hosted as an `NSView` subview
 - hardcoded URL / HTML for first visible result
 - simple lifecycle: create, attach, resize, destroy
 
 ### Out of scope (for now)
+
 - Linux/Windows
 - sandbox/security hardening
 - JS bridge
@@ -67,18 +70,24 @@ Deliverable: written notes in code comments + compile-ready scaffolding.
 
 ## TODO Set 1 — “Get something on screen” spike (same day)
 
-- [ ] Add `webview.rs` in `gpui_macos` with:
+- [x] Add `webview.rs` in `gpui_macos` with:
   - `create_wkwebview(frame: NSRect) -> id`
   - `load_url(webview: id, url: &str)`
   - `set_frame(webview: id, frame: NSRect)`
   - `remove_from_superview(webview: id)`
-- [ ] In macOS window creation path:
+- [x] In macOS window creation path:
   - create `WKWebView`
   - add as subview to content view
   - set autoresizing mask or manual resize hook
   - load `https://example.com`
-- [ ] Add temporary command-line or env flag (`ZED_EXPERIMENTAL_WEBVIEW=1`) to enable.
-- [ ] Ensure app still starts with feature off.
+- [x] Add temporary command-line or env flag (`ZED_EXPERIMENTAL_WEBVIEW=1`) to enable.
+- [x] Ensure app still starts with feature off.
+- [x] Add window-level APIs:
+  - `Window::set_webview_bounds(Option<Bounds<Pixels>>)`
+  - `Window::load_webview_url(&str)`
+- [x] Add lazy webview creation on first bounds/url call (`ensure_webview`).
+- [x] Add `gpui` split example (`webview_split`) with GPUI left pane + webview right pane.
+- [x] Make bounds ownership layout-driven for the example path (avoid ratio-based resize rewriting in platform callback).
 
 Deliverable: web page visible inside a GPUI window on macOS.
 
@@ -102,6 +111,11 @@ Deliverable: web page visible inside a GPUI window on macOS.
 
 Deliverable: repeatable local loop where web content reliably appears and updates.
 
+Status:
+
+- Builds and runs via `cargo run -p gpui --example webview_split`.
+- Runtime visual verification (flicker/layering/focus) is still a manual pass to complete.
+
 ---
 
 ## TODO Set 3 — Minimal internal API (2–4 days)
@@ -110,9 +124,10 @@ Deliverable: repeatable local loop where web content reliably appears and update
   - `open_webview(url: String)`
   - `close_webview()`
   - `set_webview_bounds(Bounds<Pixels>)`
-- [ ] Keep API intentionally private/internal first.
+- [x] Keep API intentionally private/internal first.
 - [ ] Add an experiment-only action/command to open webview for rapid testing.
 - [ ] Support `load_html_string` to remove network dependency during tests.
+- [ ] Add element-level embedding path (`div().child(webview(...))`) and route layout bounds through window/platform webview bounds updates.
 
 Deliverable: easy manual trigger to open/close/change URL without code rewiring each time.
 
@@ -131,11 +146,13 @@ Deliverable: practical host shell for OCP CAD Viewer-like sidecar.
 
 ## Suggested implementation order (fast loop)
 
-1. Hardcode webview creation + `example.com`
-2. Make it resizable and close cleanly
-3. Add enable flag
-4. Add action to toggle open/close
-5. Replace URL with local sidecar URL
+1. Hardcode webview creation + `example.com` ✅
+2. Make it resizable and close cleanly ✅
+3. Add enable flag ✅
+4. Add split example with window-level bounds API ✅
+5. Add action to toggle open/close
+6. Implement element trait + `div().child(webview(...))` embedding path
+7. Replace URL with local sidecar URL
 
 ---
 
@@ -144,6 +161,8 @@ Deliverable: practical host shell for OCP CAD Viewer-like sidecar.
 - [ ] Feature off: app behavior unchanged
 - [ ] Feature on: webview appears on launch
 - [ ] Window resize keeps webview fitted
+- [ ] Split example: GPUI left pane + webview right pane remains aligned during resize
+- [ ] Split example: no obvious flicker/layering artifacts while resizing
 - [ ] Close/reopen window does not crash
 - [ ] Keyboard focus can move webview <-> GPUI
 - [ ] Loading bad URL shows non-crashing failure state

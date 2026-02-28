@@ -539,6 +539,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
+    fn set_webview_bounds(&self, _bounds: Option<Bounds<Pixels>>) {}
+
+    fn load_webview_url(&self, _url: &str) {}
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     #[cfg(any(test, feature = "test-support"))]

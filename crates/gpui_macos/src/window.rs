@@ -1,6 +1,6 @@
 use crate::{
     BoolExt, DisplayLink, MacDisplay, NSRange, NSStringExt, events::platform_input_from_native,
-    ns_string, renderer,
+    ns_string, renderer, webview,
 };
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
@@ -407,9 +407,8 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
-    // Set 0 preflight note: future WKWebView handle should live here as Option<id>.
-    // Keep this as a non-owning cached pointer when owned by the NSView hierarchy.
     webview: Option<id>,
+    webview_bounds: Option<Bounds<Pixels>>,
     background_appearance: WindowBackgroundAppearance,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
@@ -444,6 +443,53 @@ struct MacWindowState {
 }
 
 impl MacWindowState {
+    fn ensure_webview(&mut self) -> Option<id> {
+        if let Some(webview) = self.webview {
+            return Some(webview);
+        }
+
+        let content_view = unsafe { self.native_window.contentView() };
+        if content_view == nil {
+            return None;
+        }
+
+        let frame = if let Some(bounds) = self.webview_bounds {
+            NSRect::new(
+                NSPoint::new(
+                    bounds.origin.x.as_f32() as f64,
+                    bounds.origin.y.as_f32() as f64,
+                ),
+                NSSize::new(
+                    bounds.size.width.as_f32() as f64,
+                    bounds.size.height.as_f32() as f64,
+                ),
+            )
+        } else {
+            experimental_webview_right_half_frame(content_view)?
+        };
+
+        let webview = unsafe { webview::create_wkwebview(frame) };
+        unsafe {
+            let _: () = msg_send![
+                content_view,
+                addSubview: webview
+                positioned: NSWindowOrderingMode::NSWindowAbove
+                relativeTo: self.native_view.as_ptr()
+            ];
+        }
+
+        self.webview = Some(unsafe { webview.autorelease() });
+
+        if self.webview_bounds.is_none() {
+            self.webview_bounds = Some(Bounds::new(
+                point(px(frame.origin.x as f32), px(frame.origin.y as f32)),
+                size(px(frame.size.width as f32), px(frame.size.height as f32)),
+            ));
+        }
+
+        Some(webview)
+    }
+
     fn move_traffic_light(&self) {
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() {
@@ -725,8 +771,8 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
-                // Set 0 preflight note: initialized to None until experimental webview is attached.
                 webview: None,
+                webview_bounds: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 display_link: None,
                 renderer: renderer::new_renderer(
@@ -814,6 +860,27 @@ impl MacWindow {
             ];
 
             content_view.addSubview_(native_view.autorelease());
+
+            if std::env::var_os("ZED_EXPERIMENTAL_WEBVIEW").is_some()
+                && let Some(frame) = experimental_webview_right_half_frame(content_view)
+            {
+                let webview = webview::create_wkwebview(frame);
+                let _: () = msg_send![
+                    content_view,
+                    addSubview: webview
+                    positioned: NSWindowOrderingMode::NSWindowAbove
+                    relativeTo: native_view
+                ];
+                webview::load_url(webview, "https://example.com");
+                let mut window_state = window.0.lock();
+                window_state.webview = Some(webview.autorelease());
+                window_state.webview_bounds = Some(Bounds::new(
+                    point(px(frame.origin.x as f32), px(frame.origin.y as f32)),
+                    size(px(frame.size.width as f32), px(frame.size.height as f32)),
+                ));
+                log::info!("experimental webview created and load requested");
+            }
+
             native_window.makeFirstResponder_(native_view);
 
             let app: id = NSApplication::sharedApplication(nil);
@@ -1003,11 +1070,12 @@ impl Drop for MacWindow {
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.display_link.take();
-        // Set 0 preflight note: if a WKWebView is attached and cached in `webview`,
-        // remove it here (or earlier during explicit close) before closing the window.
-        // Keeping this teardown adjacent to other window-owned resources reduces the
-        // risk of leaking retained Objective-C objects across window lifetimes.
-        this.webview.take();
+        if let Some(webview) = this.webview.take() {
+            unsafe {
+                webview::remove_from_superview(webview);
+            }
+        }
+        this.webview_bounds = None;
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1564,6 +1632,48 @@ impl PlatformWindow for MacWindow {
         None
     }
 
+    fn set_webview_bounds(&self, bounds: Option<Bounds<Pixels>>) {
+        let mut lock = self.0.lock();
+        lock.webview_bounds = bounds;
+
+        if let Some(bounds) = bounds {
+            let Some(webview) = lock.ensure_webview() else {
+                return;
+            };
+
+            let frame = NSRect::new(
+                NSPoint::new(
+                    bounds.origin.x.as_f32() as f64,
+                    bounds.origin.y.as_f32() as f64,
+                ),
+                NSSize::new(
+                    bounds.size.width.as_f32() as f64,
+                    bounds.size.height.as_f32() as f64,
+                ),
+            );
+            unsafe {
+                webview::set_hidden(webview, false);
+                webview::set_frame(webview, frame);
+            }
+        } else if let Some(webview) = lock.webview {
+            unsafe {
+                webview::set_hidden(webview, true);
+            }
+        }
+    }
+
+    fn load_webview_url(&self, url: &str) {
+        let mut lock = self.0.lock();
+        let Some(webview) = lock.ensure_webview() else {
+            return;
+        };
+
+        unsafe {
+            webview::load_url(webview, url);
+            webview::set_hidden(webview, false);
+        }
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         let executor = self.0.lock().foreground_executor.clone();
         executor
@@ -2021,9 +2131,50 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     }
 }
 
+fn experimental_webview_right_half_frame(content_view: id) -> Option<NSRect> {
+    if content_view == nil {
+        return None;
+    }
+
+    let bounds = unsafe { NSView::bounds(content_view) };
+    let half_width = bounds.size.width * 0.5;
+    Some(NSRect::new(
+        NSPoint::new(bounds.origin.x + half_width, bounds.origin.y),
+        NSSize::new(half_width, bounds.size.height),
+    ))
+}
+
 extern "C" fn window_did_resize(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    window_state.as_ref().lock().move_traffic_light();
+    let lock = window_state.as_ref().lock();
+    lock.move_traffic_light();
+
+    let Some(webview) = lock.webview else {
+        return;
+    };
+
+    let frame = lock.webview_bounds.map(|bounds| {
+        NSRect::new(
+            NSPoint::new(
+                bounds.origin.x.as_f32() as f64,
+                bounds.origin.y.as_f32() as f64,
+            ),
+            NSSize::new(
+                bounds.size.width.as_f32() as f64,
+                bounds.size.height.as_f32() as f64,
+            ),
+        )
+    });
+    drop(lock);
+
+    unsafe {
+        if let Some(frame) = frame {
+            webview::set_hidden(webview, false);
+            webview::set_frame(webview, frame);
+        } else {
+            webview::set_hidden(webview, true);
+        }
+    }
 }
 
 extern "C" fn window_will_enter_fullscreen(this: &Object, _: Sel, _: id) {
