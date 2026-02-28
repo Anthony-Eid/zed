@@ -239,3 +239,7 @@ path = "examples/mouse_pressure.rs"
 [[example]]
 name = "webview_split"
 path = "examples/webview_split.rs"
+
+[[example]]
+name = "webview_multi_embed"
+path = "examples/webview_multi_embed.rs"

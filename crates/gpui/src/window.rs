@@ -2033,6 +2033,22 @@ impl Window {
         self.platform_window.load_webview_url(url);
     }
 
+    /// Creates or updates an embedded platform webview instance in this window.
+    pub fn upsert_webview(&self, id: u64, bounds: Bounds<Pixels>, url: &str, visible: bool) {
+        self.platform_window
+            .upsert_webview(id, bounds, url, visible);
+    }
+
+    /// Destroys an embedded platform webview instance in this window.
+    pub fn destroy_webview(&self, id: u64) {
+        self.platform_window.destroy_webview(id);
+    }
+
+    /// Destroys all embedded platform webview instances in this window.
+    pub fn destroy_all_webviews(&self) {
+        self.platform_window.destroy_all_webviews();
+    }
+
     /// Determine the display on which the window is visible.
     pub fn display(&self, cx: &App) -> Option<Rc<dyn PlatformDisplay>> {
         cx.platform

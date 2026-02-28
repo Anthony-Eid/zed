@@ -10,33 +10,60 @@ unsafe extern "C" {}
 
 /// Creates a `WKWebView` configured to resize with its parent view.
 #[allow(dead_code)]
-pub(crate) unsafe fn create_wkwebview(frame: NSRect) -> id {
+pub(crate) unsafe fn create_wkwebview(frame: NSRect) -> Option<id> {
     let configuration: id = msg_send![class!(WKWebViewConfiguration), new];
-    let webview: id = msg_send![class!(WKWebView), alloc];
-    let webview: id = msg_send![webview, initWithFrame: frame configuration: configuration];
+    if configuration == nil {
+        return None;
+    }
+
+    let webview_alloc: id = msg_send![class!(WKWebView), alloc];
+    if webview_alloc == nil {
+        let _: () = msg_send![configuration, release];
+        return None;
+    }
+
+    let webview: id = msg_send![webview_alloc, initWithFrame: frame configuration: configuration];
     let _: () = msg_send![configuration, release];
 
+    if webview == nil {
+        return None;
+    }
+
     let _: () = msg_send![webview, setAutoresizingMask: NSViewWidthSizable | NSViewHeightSizable];
-    webview
+    Some(webview)
 }
 
 /// Loads a URL into a `WKWebView`.
 #[allow(dead_code)]
-pub(crate) unsafe fn load_url(webview: id, url: &str) {
+pub(crate) unsafe fn load_url(webview: id, url: &str) -> bool {
     if webview == nil {
-        return;
+        return false;
     }
 
-    let ns_string = unsafe { NSString::alloc(nil).init_str(url) };
+    let trimmed_url = url.trim();
+    if trimmed_url.is_empty() {
+        return false;
+    }
+
+    let ns_string = unsafe { NSString::alloc(nil).init_str(trimmed_url) };
+    if ns_string == nil {
+        return false;
+    }
+
     let ns_url: id = msg_send![class!(NSURL), URLWithString: ns_string];
     let _: () = msg_send![ns_string, release];
 
     if ns_url == nil {
-        return;
+        return false;
     }
 
     let request: id = msg_send![class!(NSURLRequest), requestWithURL: ns_url];
+    if request == nil {
+        return false;
+    }
+
     let _: id = msg_send![webview, loadRequest: request];
+    true
 }
 
 /// Updates a `WKWebView` frame.
@@ -68,4 +95,14 @@ pub(crate) unsafe fn set_hidden(webview: id, hidden: bool) {
 
     let hidden_flag = if hidden { 1_i8 } else { 0_i8 };
     let _: () = msg_send![webview, setHidden: hidden_flag];
+}
+
+/// Releases a retained `WKWebView`.
+#[allow(dead_code)]
+pub(crate) unsafe fn release(webview: id) {
+    if webview == nil {
+        return;
+    }
+
+    let _: () = msg_send![webview, release];
 }

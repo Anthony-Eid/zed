@@ -543,6 +543,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     fn load_webview_url(&self, _url: &str) {}
 
+    fn upsert_webview(&self, _id: u64, _bounds: Bounds<Pixels>, _url: &str, _visible: bool) {}
+
+    fn destroy_webview(&self, _id: u64) {}
+
+    fn destroy_all_webviews(&self) {}
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     #[cfg(any(test, feature = "test-support"))]

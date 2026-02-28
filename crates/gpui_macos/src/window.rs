@@ -21,6 +21,7 @@ use cocoa::{
         NSUserDefaults,
     },
 };
+use collections::FxHashMap;
 use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, ExternalPaths, FileDropEvent,
@@ -407,8 +408,7 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
-    webview: Option<id>,
-    webview_bounds: Option<Bounds<Pixels>>,
+    webviews: FxHashMap<u64, id>,
     background_appearance: WindowBackgroundAppearance,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
@@ -443,8 +443,8 @@ struct MacWindowState {
 }
 
 impl MacWindowState {
-    fn ensure_webview(&mut self) -> Option<id> {
-        if let Some(webview) = self.webview {
+    fn ensure_webview_for_id(&mut self, id: u64, frame: NSRect) -> Option<id> {
+        if let Some(webview) = self.webviews.get(&id).copied() {
             return Some(webview);
         }
 
@@ -453,22 +453,7 @@ impl MacWindowState {
             return None;
         }
 
-        let frame = if let Some(bounds) = self.webview_bounds {
-            NSRect::new(
-                NSPoint::new(
-                    bounds.origin.x.as_f32() as f64,
-                    bounds.origin.y.as_f32() as f64,
-                ),
-                NSSize::new(
-                    bounds.size.width.as_f32() as f64,
-                    bounds.size.height.as_f32() as f64,
-                ),
-            )
-        } else {
-            experimental_webview_right_half_frame(content_view)?
-        };
-
-        let webview = unsafe { webview::create_wkwebview(frame) };
+        let webview = unsafe { webview::create_wkwebview(frame)? };
         unsafe {
             let _: () = msg_send![
                 content_view,
@@ -478,16 +463,26 @@ impl MacWindowState {
             ];
         }
 
-        self.webview = Some(unsafe { webview.autorelease() });
-
-        if self.webview_bounds.is_none() {
-            self.webview_bounds = Some(Bounds::new(
-                point(px(frame.origin.x as f32), px(frame.origin.y as f32)),
-                size(px(frame.size.width as f32), px(frame.size.height as f32)),
-            ));
-        }
-
+        self.webviews.insert(id, webview);
         Some(webview)
+    }
+
+    fn destroy_webview_for_id(&mut self, id: u64) {
+        if let Some(webview) = self.webviews.remove(&id) {
+            unsafe {
+                webview::remove_from_superview(webview);
+                webview::release(webview);
+            }
+        }
+    }
+
+    fn destroy_all_webviews(&mut self) {
+        for (_, webview) in self.webviews.drain() {
+            unsafe {
+                webview::remove_from_superview(webview);
+                webview::release(webview);
+            }
+        }
     }
 
     fn move_traffic_light(&self) {
@@ -771,8 +766,7 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
-                webview: None,
-                webview_bounds: None,
+                webviews: FxHashMap::default(),
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 display_link: None,
                 renderer: renderer::new_renderer(
@@ -864,21 +858,12 @@ impl MacWindow {
             if std::env::var_os("ZED_EXPERIMENTAL_WEBVIEW").is_some()
                 && let Some(frame) = experimental_webview_right_half_frame(content_view)
             {
-                let webview = webview::create_wkwebview(frame);
-                let _: () = msg_send![
-                    content_view,
-                    addSubview: webview
-                    positioned: NSWindowOrderingMode::NSWindowAbove
-                    relativeTo: native_view
-                ];
-                webview::load_url(webview, "https://example.com");
                 let mut window_state = window.0.lock();
-                window_state.webview = Some(webview.autorelease());
-                window_state.webview_bounds = Some(Bounds::new(
-                    point(px(frame.origin.x as f32), px(frame.origin.y as f32)),
-                    size(px(frame.size.width as f32), px(frame.size.height as f32)),
-                ));
-                log::info!("experimental webview created and load requested");
+                if let Some(webview) = window_state.ensure_webview_for_id(0, frame) {
+                    let _loaded = webview::load_url(webview, "https://example.com");
+                    webview::set_hidden(webview, false);
+                    log::info!("experimental webview created and load requested");
+                }
             }
 
             native_window.makeFirstResponder_(native_view);
@@ -1070,12 +1055,7 @@ impl Drop for MacWindow {
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.display_link.take();
-        if let Some(webview) = this.webview.take() {
-            unsafe {
-                webview::remove_from_superview(webview);
-            }
-        }
-        this.webview_bounds = None;
+        this.destroy_all_webviews();
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1634,44 +1614,88 @@ impl PlatformWindow for MacWindow {
 
     fn set_webview_bounds(&self, bounds: Option<Bounds<Pixels>>) {
         let mut lock = self.0.lock();
-        lock.webview_bounds = bounds;
 
-        if let Some(bounds) = bounds {
-            let Some(webview) = lock.ensure_webview() else {
-                return;
-            };
+        let Some(bounds) = bounds else {
+            lock.destroy_webview_for_id(0);
+            return;
+        };
 
-            let frame = NSRect::new(
-                NSPoint::new(
-                    bounds.origin.x.as_f32() as f64,
-                    bounds.origin.y.as_f32() as f64,
-                ),
-                NSSize::new(
-                    bounds.size.width.as_f32() as f64,
-                    bounds.size.height.as_f32() as f64,
-                ),
-            );
-            unsafe {
-                webview::set_hidden(webview, false);
-                webview::set_frame(webview, frame);
-            }
-        } else if let Some(webview) = lock.webview {
-            unsafe {
-                webview::set_hidden(webview, true);
-            }
+        let frame = NSRect::new(
+            NSPoint::new(
+                bounds.origin.x.as_f32() as f64,
+                bounds.origin.y.as_f32() as f64,
+            ),
+            NSSize::new(
+                bounds.size.width.as_f32() as f64,
+                bounds.size.height.as_f32() as f64,
+            ),
+        );
+
+        let Some(webview) = lock.ensure_webview_for_id(0, frame) else {
+            return;
+        };
+
+        unsafe {
+            webview::set_hidden(webview, false);
+            webview::set_frame(webview, frame);
         }
     }
 
     fn load_webview_url(&self, url: &str) {
         let mut lock = self.0.lock();
-        let Some(webview) = lock.ensure_webview() else {
+        let content_view = unsafe { lock.native_window.contentView() };
+        let Some(frame) = experimental_webview_right_half_frame(content_view) else {
+            return;
+        };
+
+        let Some(webview) = lock.ensure_webview_for_id(0, frame) else {
+            return;
+        };
+
+        let loaded = unsafe { webview::load_url(webview, url) };
+        if loaded {
+            unsafe {
+                webview::set_hidden(webview, false);
+            }
+        }
+    }
+
+    fn upsert_webview(&self, id: u64, bounds: Bounds<Pixels>, url: &str, visible: bool) {
+        let mut lock = self.0.lock();
+
+        let frame = NSRect::new(
+            NSPoint::new(
+                bounds.origin.x.as_f32() as f64,
+                bounds.origin.y.as_f32() as f64,
+            ),
+            NSSize::new(
+                bounds.size.width.as_f32() as f64,
+                bounds.size.height.as_f32() as f64,
+            ),
+        );
+
+        let Some(webview) = lock.ensure_webview_for_id(id, frame) else {
             return;
         };
 
         unsafe {
-            webview::load_url(webview, url);
-            webview::set_hidden(webview, false);
+            webview::set_frame(webview, frame);
+            webview::set_hidden(webview, !visible);
         }
+
+        if visible {
+            let _loaded = unsafe { webview::load_url(webview, url) };
+        }
+    }
+
+    fn destroy_webview(&self, id: u64) {
+        let mut lock = self.0.lock();
+        lock.destroy_webview_for_id(id);
+    }
+
+    fn destroy_all_webviews(&self) {
+        let mut lock = self.0.lock();
+        lock.destroy_all_webviews();
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
@@ -2148,33 +2172,6 @@ extern "C" fn window_did_resize(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let lock = window_state.as_ref().lock();
     lock.move_traffic_light();
-
-    let Some(webview) = lock.webview else {
-        return;
-    };
-
-    let frame = lock.webview_bounds.map(|bounds| {
-        NSRect::new(
-            NSPoint::new(
-                bounds.origin.x.as_f32() as f64,
-                bounds.origin.y.as_f32() as f64,
-            ),
-            NSSize::new(
-                bounds.size.width.as_f32() as f64,
-                bounds.size.height.as_f32() as f64,
-            ),
-        )
-    });
-    drop(lock);
-
-    unsafe {
-        if let Some(frame) = frame {
-            webview::set_hidden(webview, false);
-            webview::set_frame(webview, frame);
-        } else {
-            webview::set_hidden(webview, true);
-        }
-    }
 }
 
 extern "C" fn window_will_enter_fullscreen(this: &Object, _: Sel, _: id) {
