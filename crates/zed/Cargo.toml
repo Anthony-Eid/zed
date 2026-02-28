@@ -82,6 +82,7 @@ call.workspace = true
 chrono.workspace = true
 channel.workspace = true
 clap.workspace = true
+cad_element.workspace = true
 cli.workspace = true
 client.workspace = true
 codestral.workspace = true

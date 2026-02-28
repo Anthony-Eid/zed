@@ -1,0 +1,23 @@
+[package]
+name = "cad_element"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/cad_element.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+log.workspace = true
+serde.workspace = true
+settings.workspace = true
+theme.workspace = true
+ui.workspace = true
+workspace.workspace = true

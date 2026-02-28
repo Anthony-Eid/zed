@@ -672,6 +672,7 @@ fn main() {
 
         editor::init(cx);
         image_viewer::init(cx);
+        cad_element::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
 
