@@ -236,9 +236,7 @@ path = "examples/grid_layout.rs"
 name = "mouse_pressure"
 path = "examples/mouse_pressure.rs"
 
-[[example]]
-name = "webview_split"
-path = "examples/webview_split.rs"
+
 
 [[example]]
 name = "webview_multi_embed"

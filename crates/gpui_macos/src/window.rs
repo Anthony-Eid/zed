@@ -1620,10 +1620,19 @@ impl PlatformWindow for MacWindow {
             return;
         };
 
+        let content_view = unsafe { lock.native_window.contentView() };
+        let content_height = if content_view != nil {
+            unsafe { NSView::frame(content_view).size.height }
+        } else {
+            0.0
+        };
+
         let frame = NSRect::new(
             NSPoint::new(
                 bounds.origin.x.as_f32() as f64,
-                bounds.origin.y.as_f32() as f64,
+                content_height
+                    - bounds.origin.y.as_f32() as f64
+                    - bounds.size.height.as_f32() as f64,
             ),
             NSSize::new(
                 bounds.size.width.as_f32() as f64,
@@ -1660,13 +1669,29 @@ impl PlatformWindow for MacWindow {
         }
     }
 
-    fn upsert_webview(&self, id: u64, bounds: Bounds<Pixels>, url: &str, visible: bool) {
+    fn upsert_webview(
+        &self,
+        id: u64,
+        bounds: Bounds<Pixels>,
+        url: &str,
+        visible: bool,
+        corner_radius: Pixels,
+    ) {
         let mut lock = self.0.lock();
+
+        let content_view = unsafe { lock.native_window.contentView() };
+        let content_height = if content_view != nil {
+            unsafe { NSView::frame(content_view).size.height }
+        } else {
+            0.0
+        };
 
         let frame = NSRect::new(
             NSPoint::new(
                 bounds.origin.x.as_f32() as f64,
-                bounds.origin.y.as_f32() as f64,
+                content_height
+                    - bounds.origin.y.as_f32() as f64
+                    - bounds.size.height.as_f32() as f64,
             ),
             NSSize::new(
                 bounds.size.width.as_f32() as f64,
@@ -1681,6 +1706,7 @@ impl PlatformWindow for MacWindow {
         unsafe {
             webview::set_frame(webview, frame);
             webview::set_hidden(webview, !visible);
+            webview::set_corner_radius(webview, corner_radius.as_f32() as f64);
         }
 
         if visible {

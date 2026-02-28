@@ -82,12 +82,11 @@ Deliverable: written notes in code comments + compile-ready scaffolding.
   - load `https://example.com`
 - [x] Add temporary command-line or env flag (`ZED_EXPERIMENTAL_WEBVIEW=1`) to enable.
 - [x] Ensure app still starts with feature off.
-- [x] Add window-level APIs:
-  - `Window::set_webview_bounds(Option<Bounds<Pixels>>)`
-  - `Window::load_webview_url(&str)`
-- [x] Add lazy webview creation on first bounds/url call (`ensure_webview`).
-- [x] Add `gpui` split example (`webview_split`) with GPUI left pane + webview right pane.
+- [x] Add initial window-level APIs during migration (`set_webview_bounds` / `load_webview_url`) and later remove them once element embedding is available.
+- [x] Add lazy webview creation on first bounds/url call (`ensure_webview`) during migration.
+- [x] Add `gpui` split example (`webview_split`) during migration, then remove it after element embedding lands.
 - [x] Make bounds ownership layout-driven for the example path (avoid ratio-based resize rewriting in platform callback).
+- [x] Remove legacy window-level webview API and migrate to element-driven embedding.
 
 Deliverable: web page visible inside a GPUI window on macOS.
 
@@ -113,7 +112,8 @@ Deliverable: repeatable local loop where web content reliably appears and update
 
 Status:
 
-- Builds and runs via `cargo run -p gpui --example webview_split`.
+- Builds and runs via the element embedding path (`webview_multi_embed` example).
+- Legacy split example and window-level API path have been removed.
 - Runtime visual verification (flicker/layering/focus) is still a manual pass to complete.
 
 ---
@@ -149,10 +149,11 @@ Deliverable: practical host shell for OCP CAD Viewer-like sidecar.
 1. Hardcode webview creation + `example.com` ✅
 2. Make it resizable and close cleanly ✅
 3. Add enable flag ✅
-4. Add split example with window-level bounds API ✅
+4. Add split example with window-level bounds API ✅ (completed and later removed)
 5. Add action to toggle open/close
-6. Implement element trait + `div().child(webview(...))` embedding path
+6. Implement element trait + `div().child(webview(...))` embedding path ✅
 7. Replace URL with local sidecar URL
+8. Remove legacy window-level webview API and migrated split example ✅
 
 ---
 
@@ -161,8 +162,8 @@ Deliverable: practical host shell for OCP CAD Viewer-like sidecar.
 - [ ] Feature off: app behavior unchanged
 - [ ] Feature on: webview appears on launch
 - [ ] Window resize keeps webview fitted
-- [ ] Split example: GPUI left pane + webview right pane remains aligned during resize
-- [ ] Split example: no obvious flicker/layering artifacts while resizing
+- [ ] Multi embed example: webviews remain aligned during resize
+- [ ] Multi embed example: no obvious flicker/layering artifacts while resizing
 - [ ] Close/reopen window does not crash
 - [ ] Keyboard focus can move webview <-> GPUI
 - [ ] Loading bad URL shows non-crashing failure state

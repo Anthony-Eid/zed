@@ -1,6 +1,6 @@
 use crate::{
     App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    Style, StyleRefinement, Styled, Window, hash,
+    Pixels, Style, StyleRefinement, Styled, Window, hash,
 };
 use refineable::Refineable;
 
@@ -102,8 +102,24 @@ impl Element for Webview {
         let clipped_bounds = bounds.intersect(&content_mask.bounds);
         let should_show = self.visible && !clipped_bounds.is_empty();
 
+        let rem_size = window.rem_size();
+        let corner_radii = request_layout.0.corner_radii.to_pixels(rem_size);
+        let max_corner_radius = Pixels::from(
+            corner_radii
+                .top_left
+                .max(corner_radii.top_right)
+                .max(corner_radii.bottom_left)
+                .max(corner_radii.bottom_right),
+        );
+
         if should_show {
-            window.upsert_webview(native_id, clipped_bounds, &self.url, true);
+            window.upsert_webview(
+                native_id,
+                clipped_bounds,
+                &self.url,
+                true,
+                max_corner_radius,
+            );
         } else if was_visible_in_previous_frame {
             window.destroy_webview(native_id);
         }

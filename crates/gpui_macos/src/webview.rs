@@ -97,6 +97,21 @@ pub(crate) unsafe fn set_hidden(webview: id, hidden: bool) {
     let _: () = msg_send![webview, setHidden: hidden_flag];
 }
 
+/// Sets the corner radius on a `WKWebView` by configuring its backing layer.
+#[allow(dead_code)]
+pub(crate) unsafe fn set_corner_radius(webview: id, radius: f64) {
+    if webview == nil {
+        return;
+    }
+
+    let _: () = msg_send![webview, setWantsLayer: true];
+    let layer: id = msg_send![webview, layer];
+    if layer != nil {
+        let _: () = msg_send![layer, setCornerRadius: radius];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+    }
+}
+
 /// Releases a retained `WKWebView`.
 #[allow(dead_code)]
 pub(crate) unsafe fn release(webview: id) {
