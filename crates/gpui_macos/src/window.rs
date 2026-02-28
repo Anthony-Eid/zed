@@ -407,6 +407,9 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
+    // Set 0 preflight note: future WKWebView handle should live here as Option<id>.
+    // Keep this as a non-owning cached pointer when owned by the NSView hierarchy.
+    webview: Option<id>,
     background_appearance: WindowBackgroundAppearance,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
@@ -722,6 +725,8 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
+                // Set 0 preflight note: initialized to None until experimental webview is attached.
+                webview: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 display_link: None,
                 renderer: renderer::new_renderer(
@@ -998,6 +1003,11 @@ impl Drop for MacWindow {
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.display_link.take();
+        // Set 0 preflight note: if a WKWebView is attached and cached in `webview`,
+        // remove it here (or earlier during explicit close) before closing the window.
+        // Keeping this teardown adjacent to other window-owned resources reduces the
+        // risk of leaking retained Objective-C objects across window lifetimes.
+        this.webview.take();
         unsafe {
             this.native_window.setDelegate_(nil);
         }

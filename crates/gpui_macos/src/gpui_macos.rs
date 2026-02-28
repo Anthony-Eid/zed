@@ -26,6 +26,7 @@ mod open_type;
 mod text_system;
 
 mod platform;
+mod webview;
 mod window;
 mod window_appearance;
 
