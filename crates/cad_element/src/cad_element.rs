@@ -1,16 +1,268 @@
+use std::io::Write as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 
+use agent::AgentTool;
+use agent_client_protocol::ToolKind;
 use anyhow::Context as _;
+use base64::Engine as _;
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    SharedString, Styled, Task, Window, actions, div, prelude::*, px, rgb, webview,
+    App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
+    ParentElement, Render, SharedString, Styled, Task, Window, actions, div, prelude::*, px, rgb,
+    webview,
 };
+use language_model::{LanguageModelImage, LanguageModelToolResultContent};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use ui::prelude::*;
 use workspace::Workspace;
 use workspace::item::Item;
 
 actions!(cad, [OpenCadViewer]);
+
+/// Executes a build123d/CadQuery Python script and sends the resulting 3D model to the running
+/// ocp_vscode viewer so it can be inspected interactively.
+///
+/// The script must use `show(...)` or `show_object(...)` from `ocp_vscode` to display objects.
+/// The viewer must already be open and running (use the `open_cad_viewer` action first).
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RenderCadCodeInput {
+    /// The complete Python script to execute. Must import build123d or CadQuery and call
+    /// show(...) or show_object(...) to send the model to the viewer.
+    pub code: String,
+    /// The port the ocp_vscode viewer is listening on. Defaults to 3939 if not specified.
+    pub port: Option<u16>,
+}
+
+pub struct RenderCadCodeTool;
+
+impl AgentTool for RenderCadCodeTool {
+    type Input = RenderCadCodeInput;
+    type Output = String;
+
+    const NAME: &'static str = "render_cad_code";
+
+    fn kind() -> ToolKind {
+        ToolKind::Execute
+    }
+
+    fn initial_title(
+        &self,
+        input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        match input {
+            Ok(input) => {
+                let first_line = input.code.lines().next().unwrap_or("").trim();
+                if first_line.is_empty() {
+                    "Render CAD code".into()
+                } else {
+                    format!("Render: {}", first_line).into()
+                }
+            }
+            Err(_) => "Render CAD code".into(),
+        }
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: agent::ToolInput<Self::Input>,
+        _event_stream: agent::ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        cx.background_spawn(async move {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
+
+            let port = input.port.unwrap_or(DEFAULT_PORT);
+
+            let mut temp_file = tempfile::Builder::new()
+                .suffix(".py")
+                .tempfile()
+                .map_err(|e| format!("Failed to create temp file: {e}"))?;
+
+            let script = format!(
+                "import ocp_vscode\nocp_vscode.set_port({})\n{}",
+                port, input.code
+            );
+
+            temp_file
+                .write_all(script.as_bytes())
+                .map_err(|e| format!("Failed to write script: {e}"))?;
+
+            let script_path = temp_file.path().to_string_lossy().into_owned();
+
+            let output = Command::new("uv")
+                .args([
+                    "run",
+                    "--with",
+                    "ocp-vscode",
+                    "--with",
+                    "build123d",
+                    "--",
+                    "python",
+                    &script_path,
+                ])
+                .output()
+                .or_else(|_| Command::new("python3").args(["--", &script_path]).output())
+                .map_err(|e| format!("Failed to run Python: {e}"))?;
+
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.trim().is_empty() {
+                    Ok("CAD model rendered successfully.".to_string())
+                } else {
+                    Ok(format!(
+                        "CAD model rendered successfully.\n{}",
+                        stdout.trim()
+                    ))
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut message = String::from("Script execution failed.");
+                if !stderr.trim().is_empty() {
+                    message.push('\n');
+                    message.push_str(stderr.trim());
+                }
+                if !stdout.trim().is_empty() {
+                    message.push('\n');
+                    message.push_str(stdout.trim());
+                }
+                Err(message)
+            }
+        })
+    }
+}
+
+/// Takes a screenshot of the current 3D model displayed in the ocp_vscode CAD viewer and returns
+/// it as an image so the agent can visually verify the rendered output.
+///
+/// The viewer must already be open and displaying a model. Use `render_cad_code` first to send
+/// a model to the viewer.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ScreenshotCadViewerInput {
+    /// The port the ocp_vscode viewer is listening on. Defaults to 3939 if not specified.
+    pub port: Option<u16>,
+}
+
+pub struct ScreenshotCadViewerTool;
+
+impl AgentTool for ScreenshotCadViewerTool {
+    type Input = ScreenshotCadViewerInput;
+    type Output = LanguageModelToolResultContent;
+
+    const NAME: &'static str = "screenshot_cad_viewer";
+
+    fn kind() -> ToolKind {
+        ToolKind::Read
+    }
+
+    fn initial_title(
+        &self,
+        _input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        "Screenshot CAD viewer".into()
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: agent::ToolInput<Self::Input>,
+        _event_stream: agent::ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        cx.background_spawn(async move {
+            take_screenshot(input).await.map_err(|e| {
+                LanguageModelToolResultContent::Text(Arc::from(e.to_string().as_str()))
+            })
+        })
+    }
+}
+
+async fn take_screenshot(
+    input: agent::ToolInput<ScreenshotCadViewerInput>,
+) -> anyhow::Result<LanguageModelToolResultContent> {
+    let input = input
+        .recv()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to receive tool input: {e}"))?;
+
+    let port = input.port.unwrap_or(DEFAULT_PORT);
+
+    let temp_path = std::env::temp_dir().join("cad_screenshot.png");
+    let temp_path_str = temp_path.to_string_lossy().into_owned();
+
+    // Ask the viewer to save a screenshot to the temp path by running a small Python helper.
+    let script = format!(
+        "import ocp_vscode\n\
+         ocp_vscode.set_port({port})\n\
+         ocp_vscode.save_screenshot('{temp_path_str}', port={port})\n"
+    );
+
+    let mut temp_script = tempfile::Builder::new()
+        .suffix(".py")
+        .tempfile()
+        .context("Failed to create temp script")?;
+
+    temp_script
+        .write_all(script.as_bytes())
+        .context("Failed to write screenshot script")?;
+
+    let script_path = temp_script.path().to_string_lossy().into_owned();
+
+    let output = Command::new("uv")
+        .args([
+            "run",
+            "--with",
+            "ocp-vscode",
+            "--with",
+            "build123d",
+            "--",
+            "python",
+            &script_path,
+        ])
+        .output()
+        .or_else(|_| Command::new("python3").args(["--", &script_path]).output())
+        .context("Failed to run screenshot command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Screenshot command failed: {}", stderr.trim());
+    }
+
+    // Poll briefly for the file to appear (save_screenshot polls internally but we
+    // double-check here to handle any timing edge cases).
+    let mut png_bytes = None;
+    for _ in 0..20 {
+        if temp_path.exists() {
+            match std::fs::read(&temp_path) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    png_bytes = Some(bytes);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let bytes = png_bytes.context(
+        "Screenshot file was not created within the timeout. \
+         Is the CAD viewer open and showing a model?",
+    )?;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let image = LanguageModelImage {
+        source: SharedString::from(encoded),
+        size: None,
+    };
+
+    Ok(LanguageModelToolResultContent::Image(image))
+}
 
 const DEFAULT_PORT: u16 = 3939;
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -296,12 +548,22 @@ impl Item for CadViewer {
     }
 }
 
+pub fn register_tools(thread: &mut agent::Thread) {
+    thread.add_tool(RenderCadCodeTool);
+    thread.add_tool(ScreenshotCadViewerTool);
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
         };
         CadViewer::register(workspace, window, cx);
+    })
+    .detach();
+
+    cx.observe_new(|thread: &mut agent::Thread, _window, _cx| {
+        register_tools(thread);
     })
     .detach();
 }

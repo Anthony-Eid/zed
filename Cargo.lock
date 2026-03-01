@@ -2481,11 +2481,18 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 name = "cad_element"
 version = "0.1.0"
 dependencies = [
+ "agent",
+ "agent-client-protocol",
  "anyhow",
+ "base64 0.22.1",
  "gpui",
+ "language_model",
  "log",
+ "schemars",
  "serde",
+ "serde_json",
  "settings",
+ "tempfile",
  "theme",
  "ui",
  "workspace",
